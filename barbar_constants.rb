@@ -1,0 +1,26 @@
+# QUIET
+# barbar_constants.rb - Constants and configuration paths for BarBar
+
+module BarBar
+  ICON_FOLDER   ||= File.join(DATA_DIR, 'icons')
+  CONFIG_FILE   ||= File.join(ICON_FOLDER, "#{Char.name}_bars.yaml")
+  BUTTON_CFG    ||= File.join(ICON_FOLDER, "#{Char.name}_buttons.yaml")
+
+  ICON_WIDTH    ||= 64
+  ICON_HEIGHT   ||= 64
+  ICONS_PER_ROW ||= 2048 / ICON_WIDTH
+
+  TIMER_UPDATE_INTERVAL ||= 250 # ms
+  SAVE_DEBOUNCE_DELAY ||= 1000 # ms
+  DEFAULT_ICON_SIZE ||= 64
+  MAX_PREVIEW_SIZE ||= 75
+
+  MAX_CACHE_SIZE ||= 200
+  MAX_SPRITE_CACHE_SIZE ||= 5
+  MAX_COMPILED_EXPR_CACHE ||= 100
+
+  VARIANTS ||= [
+    '', '_green', '_blue', '_red',
+    '_greyscale', '_greyscale_green', '_greyscale_blue', '_greyscale_red'
+  ]
+end
