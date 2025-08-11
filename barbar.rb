@@ -20,6 +20,7 @@ require 'yaml'
 # Load all the modular components
 Script.run('barbar_constants')
 Script.run('barbar_helpers')
+Script.run('barbar_variants')
 Script.run('barbar_config_window')
 Script.run('barbar_button')
 Script.run('barbar_bar_window')

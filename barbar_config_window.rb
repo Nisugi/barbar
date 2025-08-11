@@ -80,6 +80,22 @@ class ConfigWindow < Gtk::Window
         bar_cfg['buttons'] = sel
       end
 
+      # Pre-generate all icon variants
+      button_configs = BarBar.load_button_configs
+      result = BarBar::Variants.pregenerate_all(button_configs)
+      if result[:errors].any?
+        # Show warning dialog but continue
+        dialog = Gtk::MessageDialog.new(
+          parent: self,
+          flags: :destroy_with_parent,
+          type: :warning,
+          buttons_type: :ok,
+          message: "Some icon variants could not be generated:\n#{result[:errors].take(5).join("\n")}"
+        )
+        dialog.run
+        dialog.destroy
+      end
+
       # persist & reload all bars
       File.write(BarBar::CONFIG_FILE, @config.to_yaml)
       BarBar.initialize
@@ -159,7 +175,10 @@ class ConfigWindow < Gtk::Window
       fg.attach(preview, 2, 0, 4, 2)
 
       vcombo = Gtk::ComboBoxText.new
-      BarBar::VARIANTS.each { |v| vcombo.append_text(v) }
+      ['', 'grayscale', 'green', 'blue', 'red', 
+       'grayscale_green', 'grayscale_blue', 'grayscale_red'].each { |v| 
+        vcombo.append_text(v) 
+      }
       vcombo.active = 0
       fg.attach(Gtk::Label.new('Variant:'),   0, 0, 1, 1)
       fg.attach(vcombo,                       1, 0, 1, 1)
@@ -205,22 +224,15 @@ class ConfigWindow < Gtk::Window
 
       updater = -> {
         base    = img_combo.active_text
-        variant = vcombo.active_text || ''
+        variant_str = vcombo.active_text || ''
         num     = ispin.value_as_int
-        file    = File.join(BarBar::ICON_FOLDER, "#{base}#{variant}.png")
-        if File.exist?(file)
-          pix = GdkPixbuf::Pixbuf.new(file: file)
-          cx  = (num - 1) % BarBar::ICONS_PER_ROW
-          ry  = (num - 1) / BarBar::ICONS_PER_ROW
-          sub = pix.subpixbuf(
-            cx * BarBar::ICON_WIDTH,
-            ry * BarBar::ICON_HEIGHT,
-            BarBar::ICON_WIDTH,
-            BarBar::ICON_HEIGHT
-          )
-          thumb = sub.scale_simple(64, 64, GdkPixbuf::InterpType::BILINEAR)
+        begin
+          # Use the variant system to get the icon
+          icon = BarBar::Variants.get_icon(base, num, variant_str)
+          thumb = icon.scale_simple(64, 64, GdkPixbuf::InterpType::BILINEAR)
           preview.set_from_pixbuf(thumb)
-        else
+        rescue => e
+          BarBar.log(:debug, "Preview error: #{e}")
           preview.clear
         end
       }
@@ -293,9 +305,12 @@ class ConfigWindow < Gtk::Window
   end
 
   def build_browse_icons_tab
-    # gather all distinct image bases
+    # Only show base sprite maps (no variants)
     images = Dir.glob(File.join(BarBar::ICON_FOLDER, '*.png'))
                 .map { |f| File.basename(f, '.png') }
+                .reject { |f| f.include?('_green') || f.include?('_blue') || 
+                             f.include?('_red') || f.include?('_greyscale') || 
+                             f.include?('_grayscale') }
                 .uniq
                 .sort
 
@@ -341,11 +356,13 @@ class ConfigWindow < Gtk::Window
         return
       end
       begin
-        pix  = GdkPixbuf::Pixbuf.new(file: file)
+        pix = GdkPixbuf::Pixbuf.new(file: file)
+        icons_per_row = pix.width / BarBar::ICON_WIDTH
+        max_rows = pix.height / BarBar::ICON_HEIGHT
         row  = row_spin.value_as_int - 1
-        start = row * BarBar::ICONS_PER_ROW
+        start = row * icons_per_row
 
-        BarBar::ICONS_PER_ROW.times do |i|
+        icons_per_row.times do |i|
           sub = pix.subpixbuf(i * BarBar::ICON_WIDTH, row * BarBar::ICON_HEIGHT,
                               BarBar::ICON_WIDTH, BarBar::ICON_HEIGHT)
           thumb = sub.scale_simple(75, 75, GdkPixbuf::InterpType::BILINEAR)
