@@ -94,8 +94,8 @@ module BarBar
   end
 
   def self.clear_pixbuf_cache
-    @@sprite_cache.clear
-    @@sprite_lru.clear
+    @@pixbuf_cache.clear
+    @@pixbuf_lru.clear
   end
 
   def self.manage_cache

@@ -29,6 +29,7 @@ module BarBar
   # Top-level kickoff: load bars.yaml (or default), spin up windows
   def self.initialize
     Gtk.queue do
+      @close_window = false
       destroy_window
       raw = File.exist?(CONFIG_FILE) ? YAML.load_file(CONFIG_FILE) : nil
       if validate_config(raw)

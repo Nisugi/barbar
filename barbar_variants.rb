@@ -24,6 +24,7 @@ module BarBar
     BORDER_WIDTH = 2
     
     class << self
+      @_data_pool = []
       def initialize_cache
         require 'fileutils'
         FileUtils.mkdir_p(CACHE_DIR) unless Dir.exist?(CACHE_DIR)
@@ -48,6 +49,21 @@ module BarBar
         File.write(MANIFEST_FILE, @manifest.to_yaml)
       end
       
+      def make_pixbuf_from_pixels(src_pixbuf, pixels_str)
+        bin = pixels_str.dup
+        bin.force_encoding('ASCII-8BIT')
+        @_data_pool << bin
+        GdkPixbuf::Pixbuf.new(
+          data: bin,
+          colorspace: src_pixbuf.colorspace,
+          has_alpha: src_pixbuf.has_alpha?,
+          bits_per_sample: src_pixbuf.bits_per_sample,
+          width: src_pixbuf.width,
+          height: src_pixbuf.height,
+          rowstride: src_pixbuf.rowstride
+        )
+      end
+
       # Main entry point - get an icon variant
       def get_icon(base_map, icon_num, variant_string)
         cache_key = build_cache_key(base_map, icon_num, variant_string)
@@ -216,111 +232,91 @@ module BarBar
       end
       
       def apply_grayscale(pixbuf)
-        # Create new pixbuf for result
-        gray = pixbuf.copy
+        src = pixbuf
+        n = src.n_channels
+        w = src.width
+        h = src.height
+        stride = src.rowstride
 
-        # Use GdkPixbuf's built-in saturation if available
-        if gray.respond_to?(:saturate_and_pixelate)
-          gray.saturate_and_pixelate(0.0, false)
-          return gray
+        raw = src.pixels
+        bytes = raw.is_a?(String) ? raw.bytes : raw.dup
+
+        h.times do |y|
+          base = y * stride
+          w.times do |x|
+            off = base + x * n
+            r = bytes[off]
+            g = bytes[off + 1]
+            b = bytes[off + 2]
+            gray = (0.299 * r + 0.587 * g + 0.114 * b).to_i
+            bytes[off]     = gray
+            bytes[off + 1] = gray
+            bytes[off + 2] = gray
+            # alpha left unchanged
+          end
         end
-
-        # Get pixel data - it's already an array
-        pixels = gray.pixels.is_a?(String) ? gray.pixels.bytes.to_a : gray.pixels.dup
-        n_channels = gray.n_channels
-        width = gray.width
-        height = gray.height
-
-        # Process each pixel
-        (width * height).times do |i|
-          base = i * n_channels
-
-          r = pixels[base]
-          g = pixels[base + 1]
-          b = pixels[base + 2]
-
-          # Standard luminance formula
-          gray_value = (0.299 * r + 0.587 * g + 0.114 * b).to_i
-
-          pixels[base] = gray_value
-          pixels[base + 1] = gray_value
-          pixels[base + 2] = gray_value
-          # Keep alpha channel (base + 3) unchanged if it exists
-        end
-
-        # Convert back to proper format and apply to pixbuf
-        gray.pixels = pixels.is_a?(String) ? pixels : pixels.pack('C*')
-
-        gray
+        make_pixbuf_from_pixels(src, bytes.pack('C*'))
       end
 
       def apply_border(pixbuf, color)
+        src = pixbuf
+        n = src.n_channels
+        w = src.width
+        h = src.height
+        stride = src.rowstride
         rgb = BORDER_COLORS[color] || BORDER_COLORS[:green]
-        
-        # Create a copy to modify
-        bordered = pixbuf.copy
-        
-        # Get pixel data
-        pixels = bordered.pixels.is_a?(String) ? bordered.pixels.bytes.to_a : bordered.pixels.dup
-        n_channels = bordered.n_channels
-        width = bordered.width
-        height = bordered.height
-        
-        # Helper to get pixel offset
-        get_offset = lambda do |x, y|
-          (y * width + x) * n_channels
-        end
-        
-        # Helper to check if pixel is at edge of non-transparent area
-        is_edge = lambda do |x, y|
-          return false if x < 0 || y < 0 || x >= width || y >= height
-          
-          offset = get_offset.call(x, y)
-          # Skip transparent pixels
-          return false if n_channels > 3 && pixels[offset + 3] == 0
-          
-          # Check neighbors for transparency
-          [[-1,0], [1,0], [0,-1], [0,1], [-1,-1], [1,1], [-1,1], [1,-1]].each do |dx, dy|
-            nx, ny = x + dx, y + dy
-            # If neighbor is out of bounds or transparent, this is an edge
-            if nx < 0 || ny < 0 || nx >= width || ny >= height
-              return true
-            elsif n_channels > 3
-              n_offset = get_offset.call(nx, ny)
-              return true if pixels[n_offset + 3] == 0
-            end
-           end
-          false
-        end
-        
-        # Mark edge pixels
-        edge_pixels = []
-        height.times do |y|
-          width.times do |x|
-            edge_pixels << [x, y] if is_edge.call(x, y)
-          end
-        end
-        
-        # Apply border to edge pixels and their immediate neighbors
-        edge_pixels.each do |x, y|
-          # Apply to this pixel and BORDER_WIDTH pixels inward
-          BORDER_WIDTH.times do |dist|
-            [[-dist,0], [dist,0], [0,-dist], [0,dist], 
-             [-dist,-dist], [dist,dist], [-dist,dist], [dist,-dist]].each do |dx, dy|
-              px, py = x + dx, y + dy
-              next if px < 0 || py < 0 || px >= width || py >= height
-              
-              offset = get_offset.call(px, py)
-              next if n_channels > 3 && pixels[offset + 3] == 0  # Skip transparent
-              
-              pixels[offset] = rgb[0]
-              pixels[offset + 1] = rgb[1]
-              pixels[offset + 2] = rgb[2]
+        has_alpha = (n > 3)
+
+        raw = src.pixels
+        bytes = raw.is_a?(String) ? raw.bytes : raw.dup
+        off = ->(x, y) { y * stride + x * n }
+
+        # Solid mask (alpha > 0 if present, else everything is solid)
+        solid = Array.new(h) { Array.new(w, true) }
+        if has_alpha
+          h.times do |y|
+            base = y * stride
+            w.times do |x|
+              a = bytes[base + x * n + 3]
+              solid[y][x] = a && a > 0
             end
           end
         end
-        bordered.pixels = pixels.is_a?(String) ? pixels : pixels.pack('C*')
-        bordered
+
+        # Edge detection
+        nbrs = [[-1,0],[1,0],[0,-1],[0,1],[-1,-1],[1,1],[-1,1],[1,-1]]
+        edge = []
+        h.times do |y|
+          w.times do |x|
+            next unless solid[y][x]
+            is_edge = false
+            nbrs.each do |dx, dy|
+              nx = x + dx; ny = y + dy
+              if nx < 0 || ny < 0 || nx >= w || ny >= h || !solid[ny][nx]
+                is_edge = true; break
+              end
+            end
+            edge << [x, y] if is_edge
+          end
+        end
+
+        # Draw inward BORDER_WIDTH from edge pixels
+        edge.each do |x, y|
+          (0...BORDER_WIDTH).each do |d|
+            nbrs.each do |dx, dy|
+              px = x + dx * d
+              py = y + dy * d
+              next if px < 0 || py < 0 || px >= w || py >= h
+              next if has_alpha && !solid[py][px]
+              o = off.call(px, py)
+              bytes[o]     = rgb[0]
+              bytes[o + 1] = rgb[1]
+              bytes[o + 2] = rgb[2]
+            end
+          end
+        end
+
+        make_pixbuf_from_pixels(src, bytes.pack('C*'))
       end
     end
   end
