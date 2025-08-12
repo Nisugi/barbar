@@ -24,7 +24,6 @@ module BarBar
     BORDER_WIDTH = 2
     
     class << self
-      @_data_pool = []
       def initialize_cache
         require 'fileutils'
         FileUtils.mkdir_p(CACHE_DIR) unless Dir.exist?(CACHE_DIR)
@@ -230,93 +229,161 @@ module BarBar
         
         result
       end
+
+      def byte_get(buf, idx)
+        buf.is_a?(String) ? buf.getbyte(idx) : buf[idx]
+      end
+
+      def byte_set(buf, idx, val)
+        if buf.is_a?(String)
+          buf.setbyte(idx, val)
+        else
+          buf[idx] = val
+        end
+      end
+
+      def copy_span(dst, dst_off, src, src_off, len)
+        i = 0
+        while i < len
+          byte_set(dst, dst_off + i, byte_get(src, src_off + i))
+          i += 1
+        end
+      end
       
-      def apply_grayscale(pixbuf)
-        src = pixbuf
+      @_data_pool ||= []
+
+      def to_tight_bytes(src)
         n = src.n_channels
         w = src.width
         h = src.height
-        stride = src.rowstride
+        tight = w * n
+        s_stride = src.rowstride
+        s = src.pixels
 
-        raw = src.pixels
-        bytes = raw.is_a?(String) ? raw.bytes : raw.dup
+        out = "\x00" * (tight * h)
+        h.times do |y|
+          copy_span(out, y * tight, s, y * s_stride, tight)
+        end
+        [out, w, h, n, src.colorspace, src.has_alpha?, src.bits_per_sample]
+      end
+
+      def ensure_tight(src)
+        n = src.n_channels
+        w = src.width
+        h = src.height
+        tight = w * n
+
+        # If already tight, nothing to do
+        return src if src.rowstride == tight
+
+        dst = GdkPixbuf::Pixbuf.new(src.colorspace, src.has_alpha?, src.bits_per_sample, w, h)
+        s = src.pixels
+        d = dst.pixels
+        s_stride = src.rowstride
+        d_stride = dst.rowstride
+        row_len = tight
 
         h.times do |y|
-          base = y * stride
+          copy_span(d, y * d_stride, s, y * s_stride, row_len)
+        end
+        dst
+      end
+
+      def make_pixbuf_from_tight_bytes(w, h, n, colorspace, has_alpha, bps, bytestr)
+        @_data_pool ||= []
+        bin = bytestr.dup
+        bin.force_encoding('ASCII-8BIT')
+        @_data_pool << bin  # keep a hard ref so GC doesn't free the backing store
+
+        GdkPixbuf::Pixbuf.new(
+          data: bin,
+          colorspace: colorspace,
+          has_alpha: has_alpha,
+          bits_per_sample: bps,
+          width: w,
+          height: h,
+          rowstride: w * n
+        )
+      end
+
+      def apply_grayscale(pixbuf)
+        bytes, w, h, n, cs, has_a, bps = to_tight_bytes(pixbuf)
+        tight = w * n
+        has_alpha = (n > 3)
+
+        h.times do |y|
+          row = y * tight
           w.times do |x|
-            off = base + x * n
-            r = bytes[off]
-            g = bytes[off + 1]
-            b = bytes[off + 2]
+            off = row + x * n
+            r = byte_get(bytes, off)
+            g = byte_get(bytes, off + 1)
+            b = byte_get(bytes, off + 2)
             gray = (0.299 * r + 0.587 * g + 0.114 * b).to_i
-            bytes[off]     = gray
-            bytes[off + 1] = gray
-            bytes[off + 2] = gray
-            # alpha left unchanged
+            byte_set(bytes, off,     gray)
+            byte_set(bytes, off + 1, gray)
+            byte_set(bytes, off + 2, gray)
+            # alpha left as-is (off+3) if present
           end
         end
-        make_pixbuf_from_pixels(src, bytes.pack('C*'))
+
+        make_pixbuf_from_tight_bytes(w, h, n, cs, has_a, bps, bytes)
       end
 
       def apply_border(pixbuf, color)
-        src = pixbuf
-        n = src.n_channels
-        w = src.width
-        h = src.height
-        stride = src.rowstride
-        rgb = BORDER_COLORS[color] || BORDER_COLORS[:green]
+        base_bytes, w, h, n, cs, has_a, bps = to_tight_bytes(pixbuf)
+        tight = w * n
         has_alpha = (n > 3)
+        rgb = BORDER_COLORS[color] || BORDER_COLORS[:green]
+        bw = BORDER_WIDTH
 
-        raw = src.pixels
-        bytes = raw.is_a?(String) ? raw.bytes : raw.dup
-        off = ->(x, y) { y * stride + x * n }
+        # start from a copy of the base image
+        out = base_bytes.dup
 
-        # Solid mask (alpha > 0 if present, else everything is solid)
+        # build solid mask from alpha (or everything solid if no alpha)
         solid = Array.new(h) { Array.new(w, true) }
         if has_alpha
           h.times do |y|
-            base = y * stride
+            row = y * tight
             w.times do |x|
-              a = bytes[base + x * n + 3]
+              a = byte_get(base_bytes, row + x * n + 3)
               solid[y][x] = a && a > 0
             end
           end
         end
 
-        # Edge detection
-        nbrs = [[-1,0],[1,0],[0,-1],[0,1],[-1,-1],[1,1],[-1,1],[1,-1]]
-        edge = []
+        neighbors = [[-1,0],[1,0],[0,-1],[0,1],[-1,-1],[1,1],[-1,1],[1,-1]]
+
+        # edge detection + draw inward border
         h.times do |y|
+          row = y * tight
           w.times do |x|
             next unless solid[y][x]
-            is_edge = false
-            nbrs.each do |dx, dy|
+            edge = false
+            neighbors.each do |dx, dy|
               nx = x + dx; ny = y + dy
               if nx < 0 || ny < 0 || nx >= w || ny >= h || !solid[ny][nx]
-                is_edge = true; break
+                edge = true; break
               end
             end
-            edge << [x, y] if is_edge
-          end
-        end
+            next unless edge
 
-        # Draw inward BORDER_WIDTH from edge pixels
-        edge.each do |x, y|
-          (0...BORDER_WIDTH).each do |d|
-            nbrs.each do |dx, dy|
-              px = x + dx * d
-              py = y + dy * d
-              next if px < 0 || py < 0 || px >= w || py >= h
-              next if has_alpha && !solid[py][px]
-              o = off.call(px, py)
-              bytes[o]     = rgb[0]
-              bytes[o + 1] = rgb[1]
-              bytes[o + 2] = rgb[2]
+            (0...bw).each do |dpx|
+              neighbors.each do |dx, dy|
+                px = x + dx * dpx
+                py = y + dy * dpx
+                next if px < 0 || py < 0 || px >= w || py >= h
+                next if has_alpha && !solid[py][px]
+                off = py * tight + px * n
+                byte_set(out, off,     rgb[0])
+                byte_set(out, off + 1, rgb[1])
+                byte_set(out, off + 2, rgb[2])
+                # leave alpha channel as-is
+              end
             end
           end
         end
 
-        make_pixbuf_from_pixels(src, bytes.pack('C*'))
+        make_pixbuf_from_tight_bytes(w, h, n, cs, has_a, bps, out)
       end
     end
   end
