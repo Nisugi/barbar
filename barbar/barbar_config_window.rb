@@ -82,7 +82,7 @@ class ConfigWindow < Gtk::Window
 
       # Pre-generate all icon variants
       button_configs = BarBar.load_button_configs
-      result = BarBar::Variants.pregenerate_all(button_configs)
+      BarBar::Variants.pregenerate_all(button_configs)
 
       # persist & reload all bars
       File.write(BarBar::CONFIG_FILE, @config.to_yaml)
@@ -419,6 +419,25 @@ class ConfigWindow < Gtk::Window
 
       BarBar.instance_variable_set(:@button_configs, defs)
       BarBar.save_button_configs
+
+      # Refresh all bar pickers so new/renamed buttons appear immediately
+      begin
+        defs = BarBar.load_button_configs
+        @config['bars'].each do |bar_cfg|
+          ctrls = @controls[bar_cfg['id']]
+          next unless ctrls && ctrls[:store]
+          store = ctrls[:store]
+          store.clear
+          defs.keys.sort.each do |k|
+            iter = store.append
+            iter[0] = k
+            iter[1] = Array(bar_cfg['buttons']).include?(k)
+          end
+        end
+      rescue => e
+        BarBar.log(:debug, "Refresh pickers after save failed: #{e}")
+      end
+
       set_active_by_text(key_sel, key)
     end
 

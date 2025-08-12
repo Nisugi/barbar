@@ -891,7 +891,7 @@ class ConfigWindow < Gtk::Window
 
       # Pre-generate all icon variants
       button_configs = BarBar.load_button_configs
-      result = BarBar::Variants.pregenerate_all(button_configs)
+      BarBar::Variants.pregenerate_all(button_configs)
 
       # persist & reload all bars
       File.write(BarBar::CONFIG_FILE, @config.to_yaml)
@@ -1228,6 +1228,25 @@ class ConfigWindow < Gtk::Window
 
       BarBar.instance_variable_set(:@button_configs, defs)
       BarBar.save_button_configs
+
+      # Refresh all bar pickers so new/renamed buttons appear immediately
+      begin
+        defs = BarBar.load_button_configs
+        @config['bars'].each do |bar_cfg|
+          ctrls = @controls[bar_cfg['id']]
+          next unless ctrls && ctrls[:store]
+          store = ctrls[:store]
+          store.clear
+          defs.keys.sort.each do |k|
+            iter = store.append
+            iter[0] = k
+            iter[1] = Array(bar_cfg['buttons']).include?(k)
+          end
+        end
+      rescue => e
+        BarBar.log(:debug, "Refresh pickers after save failed: #{e}")
+      end
+
       set_active_by_text(key_sel, key)
     end
 
@@ -1878,10 +1897,11 @@ module BarBar
     end
 
     def smart_update_buttons
+  return false if @win.nil? || (@win.respond_to?(:destroyed?) && @win.destroyed?)
       now = Time.now.to_f
       updates_needed = false
 
-      visible_area = @win.visible? ? @win.allocation : nil
+      visible_area = ( @win && (!@win.respond_to?(:destroyed?) || !@win.destroyed?) && @win.visible? ) ? @win.allocation : nil
 
       @buttons.each do |key, button|
         next if button.destroyed?
@@ -1929,6 +1949,7 @@ module BarBar
 
       # Finally destroy window
       @win.destroy
+  @win = nil
     end
 
     def toggle_decorations
