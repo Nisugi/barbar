@@ -1,0 +1,2009 @@
+=begin
+  ;barbar.lic   Graphical Action Bars
+
+  right click on window to configure
+  sprite maps goes into Lich5/data/icons
+  sprite maps should be 2048 x 2048 pixels
+    with icons being 64 x 64 pixels, no padding between icons
+
+  todo:
+    investigate assigning button presses to trigger vs clicks
+    button to reload button info into memory - creating a new button requires relaunching config to populate it.
+
+  ;eq BarBar.press(key)  - triggers button
+
+=end
+
+require 'gtk3'
+require 'yaml'
+
+module BarBar
+  ICON_FOLDER   ||= File.join(DATA_DIR, 'icons')
+  CONFIG_FILE   ||= File.join(ICON_FOLDER, "#{Char.name}_bars.yaml")
+  BUTTON_CFG    ||= File.join(ICON_FOLDER, "#{Char.name}_buttons.yaml")
+
+  ICON_WIDTH    ||= 64
+  ICON_HEIGHT   ||= 64
+
+  TIMER_UPDATE_INTERVAL ||= 250 # ms
+  SAVE_DEBOUNCE_DELAY ||= 1000 # ms
+  DEFAULT_ICON_SIZE ||= 64
+  MAX_PREVIEW_SIZE ||= 75
+
+  MAX_CACHE_SIZE ||= 200
+  MAX_COMPILED_EXPR_CACHE ||= 100
+
+  MAX_DATA_POOL_SIZE ||= 50
+  MAX_BORDER_WIDTH ||= 5
+  MIN_BORDER_WIDTH ||= 1
+  DEFAULT_BORDER_WIDTH ||= 2
+end
+
+module BarBar
+  @@save_timer = nil
+  @@pixbuf_cache = {}
+  @@pixbuf_lru = []
+  @@compiled_expressions = {}
+  @@expression_lru = []
+  @@bar_windows  = []
+  @@config       = {}
+  @@disp_icon_w = ICON_WIDTH
+  @@disp_icon_h = ICON_HEIGHT
+  @@css_provider = Gtk::CssProvider.new
+  @@debug = false
+  @close_window = false
+  @@config_save_pending = false
+  @@config_save_timer = nil
+
+  def self.load_button_configs
+    unless File.exist?(BUTTON_CFG)
+      log(:info, "No button file detected. Creating one.")
+      return {}
+    end
+    @button_configs ||= File.exist?(BUTTON_CFG) ? YAML.load_file(BUTTON_CFG) : {}
+  end
+
+  def self.save_button_configs
+    require 'fileutils'
+    dir = File.dirname(BUTTON_CFG)
+    FileUtils.mkdir_p(dir) unless Dir.exist?(dir)
+    File.write(BUTTON_CFG, load_button_configs.to_yaml)
+  end
+
+  def self.config_for(key)
+    load_button_configs
+    @button_configs[key]
+  end
+
+  def self.config
+    @@config
+  end
+
+  def self.apply_css
+    dark = @@config.fetch('dark_mode', false)
+    # Get global timer font size, default to half icon height
+    timer_font_size = @@config.fetch('timer_font_size', nil) || (@@disp_icon_h / 2)
+
+    base_css = if dark
+                 <<~CSS
+        window, button, menu {
+          background-color: #2E2E2E;
+          color:            #DDDDDD;
+        }
+        button {
+          border-width: 0;
+          padding:      0;
+        }
+      CSS
+               else
+                 ""
+               end
+
+    timer_css = <<~CSS
+      .skillbar-timer {
+        font-size: #{timer_font_size}px;
+        font-weight: bold;
+        color: yellow;
+        background-color: transparent;
+        background: none;
+        border: none;
+        padding: 1px 2px;
+        text-shadow: 1px 1px 2px rgba(0,0,0,0.8), -1px -1px 2px rgba(0,0,0,0.8);
+      }
+      .skillbar-timer-critical {
+        color: #FF5555;
+      }
+    CSS
+
+    reset_css = <<~CSS
+      button {
+        padding: 0;
+        border-width: 0;
+      }
+    CSS
+
+    @@css_provider.load(data: base_css + timer_css + reset_css)
+    screen = Gdk::Screen.default
+    Gtk::StyleContext.add_provider_for_screen(
+      screen,
+      @@css_provider,
+      Gtk::StyleProvider::PRIORITY_APPLICATION
+    )
+  end
+
+  def self.clear_pixbuf_cache
+    @@pixbuf_cache.clear
+    @@pixbuf_lru.clear
+  end
+
+  def self.manage_cache
+    while @@pixbuf_cache.size > MAX_CACHE_SIZE
+      oldest = @@pixbuf_lru.shift
+      @@pixbuf_cache.delete(oldest) if oldest
+    end
+  end
+
+  def self.create_icon(cfg, state_sym, width = @@disp_icon_w, height = @@disp_icon_h)
+    begin
+      states = cfg['states'] || {}
+      state_cfg = states[state_sym.to_s] || {}
+
+      base = cfg['image']
+      variant = state_cfg['variant'] || ''
+      icon_num = (state_cfg['icon'] || 1).to_i
+
+      return Gtk::Image.new unless base
+
+      manage_cache if @@pixbuf_cache.size > MAX_CACHE_SIZE
+
+      # Create a unique key for this specific icon
+      key = "#{base}_#{icon_num}_#{variant}_#{width}x#{height}"
+
+      # Check if we have this specific icon cached
+      if @@pixbuf_cache[key]
+        @@pixbuf_lru.delete(key)
+        @@pixbuf_lru.push(key)
+      else
+        # Get the icon variant (from variant cache or generate)
+        icon = Variants.get_icon(base, icon_num, variant)
+        return Gtk::Image.new unless icon
+
+        # Scale if needed
+        if width != ICON_WIDTH || height != ICON_HEIGHT
+          @@pixbuf_cache[key] = icon.scale_simple(
+            width,
+            height,
+            GdkPixbuf::InterpType::BILINEAR
+          )
+        else
+          @@pixbuf_cache[key] = icon
+        end
+        @@pixbuf_lru.push(key)
+        manage_cache
+
+        log(:debug, "Cached icon: #{key}")
+      end
+
+      Gtk::Image.new(pixbuf: @@pixbuf_cache[key])
+    rescue => e
+      log(:error, "create_icon error: #{e}")
+      Gtk::Image.new
+    end
+  end
+
+  def self.compile_expression(expr)
+    return nil if expr.nil? || expr.empty?
+
+    # Check cache first
+    if @@compiled_expressions[expr]
+      @@expression_lru.delete(expr)
+      @@expression_lru.push(expr)
+      return @@compiled_expressions[expr]
+    end
+
+    # Compile the expression into a proc
+    begin
+      proc = eval("proc { #{expr} }")
+
+      # Add to cache
+      @@compiled_expressions[expr] = proc
+      @@expression_lru.push(expr)
+
+      # Manage cache size
+      if @@expression_lru.size > MAX_COMPILED_EXPR_CACHE
+        oldest = @@expression_lru.shift
+        @@compiled_expressions.delete(oldest)
+      end
+
+      proc
+    rescue => e
+      log(:error, "Failed to compile expression '#{expr}': #{e}")
+      nil
+    end
+  end
+
+  def self.determine_state(cfg)
+    states_cfg = cfg['states'] || {}
+
+    # Quick check for common case - no conditions at all
+    has_conditions = states_cfg.any? { |_, spec| spec['condition'] }
+    return :inactive_unready unless has_conditions
+
+    %i[active_ready active_unready inactive_ready inactive_unready].each do |state_sym|
+      spec = states_cfg[state_sym.to_s] || {}
+      cond = spec['condition']
+      next unless cond
+      next if cond.empty? || cond !~ /\S/
+
+      proc = compile_expression(cond)
+      next unless proc
+
+      begin
+        return state_sym if proc.call
+      rescue => e
+        log(:error, "determine_state execution error for #{state_sym}: #{e}")
+      end
+    end
+    :inactive_unready
+  end
+
+  def self.save_config_debounced
+    return if @@config_save_pending
+
+    @@config_save_pending = true
+
+    # Cancel existing timer
+    GLib::Source.remove(@@config_save_timer) if @@config_save_timer
+
+    # Save after 2 seconds of no changes
+    @@config_save_timer = GLib::Timeout.add(2000) do
+      File.write(CONFIG_FILE, @@config.to_yaml)
+      @@config_save_pending = false
+      @@config_save_timer = nil
+      false # Don't repeat
+    end
+  end
+
+  def self.save_window_settings(bar_cfg, window)
+    bar_cfg['position'] ||= {}
+    x, y = window.position
+    return if bar_cfg['position']['x'] == x && bar_cfg['position']['y'] == y
+    bar_cfg['position']['x'] = x
+    bar_cfg['position']['y'] = y
+    bar_cfg['window'] ||= {}
+    w, h = window.size
+    bar_cfg['window']['width']     = w
+    bar_cfg['window']['height']    = h
+    bar_cfg['window']['decorated'] = window.decorated?
+    save_config_debounced
+  end
+
+  def self.save_window_settings_debounced(bar_cfg, window)
+    # Cancel previous timer if it exists
+    GLib::Source.remove(@@save_timer) if @@save_timer
+
+    # Set new timer - save after 1 second of inactivity
+    @@save_timer = GLib::Timeout.add(1000) do
+      save_window_settings(bar_cfg, window)
+      @@save_timer = nil
+      false # Don't repeat
+    end
+  end
+
+  def self.destroy_window
+    @@bar_windows.each(&:destroy)
+    @@bar_windows.clear
+  end
+
+  def self.request_close
+    @close_window = true
+  end
+
+  def self.close_requested?
+    @close_window
+  end
+
+  def self.debug=(value)
+    @@debug = value
+  end
+
+  def self.debug?
+    @@debug || @@config.fetch('debug', false)
+  end
+
+  def self.log(level, message)
+    return unless debug? || level == :error
+    timestamp = Time.now.strftime("%H:%M:%S")
+    prefix = case level
+             when :error then "ERROR"
+             when :warn  then "WARN"
+             when :info  then "INFO"
+             when :debug then "DEBUG"
+             else level.to_s.upcase
+             end
+    puts "[BarBar #{timestamp}] #{prefix}: #{message}"
+  end
+
+  def self.validate_config(config)
+    return false unless config.is_a?(Hash)
+    return false unless config['bars'].is_a?(Array)
+
+    config['bars'].each do |bar|
+      return false unless bar.is_a?(Hash)
+      return false unless bar['id']
+      return false unless bar['name']
+
+      # Validate position
+      if bar['position']
+        return false unless bar['position'].is_a?(Hash)
+        return false unless bar['position']['x'].is_a?(Numeric) || bar['position']['x'].nil?
+        return false unless bar['position']['y'].is_a?(Numeric) || bar['position']['y'].nil?
+      end
+
+      # Validate size
+      if bar['size']
+        return false unless bar['size'].is_a?(Hash)
+        %w[cols rows icon_size].each do |key|
+          val = bar['size'][key]
+          return false unless val.nil? || val.is_a?(Numeric)
+        end
+      end
+
+      # Validate buttons array
+      return false unless bar['buttons'].nil? || bar['buttons'].is_a?(Array)
+    end
+
+    true
+  rescue => e
+    log(:error, "Config validation error: #{e}")
+    false
+  end
+
+  def self.show_timers?
+    @@config.fetch('show_timers', true)
+  end
+
+  def self.bar_windows
+    @@bar_windows
+  end
+
+  def self.press(key)
+    cfg = config_for(key)
+    return unless cfg
+    state = determine_state(cfg)
+    cmd   = cfg.dig('states', state.to_s, 'command')
+    return if cmd.to_s.strip.empty?
+
+    do_client(cmd)
+    puts(">#{cmd}")
+  end
+end
+
+module BarBar
+  module Variants
+    CACHE_VERSION = 2  # Bumped to invalidate old cache
+    CACHE_DIR = File.join(ICON_FOLDER, 'cache', 'variants')
+    MANIFEST_FILE = File.join(CACHE_DIR, 'manifest.yaml')
+    
+    class << self
+      def initialize_cache
+        require 'fileutils'
+        FileUtils.mkdir_p(CACHE_DIR) unless Dir.exist?(CACHE_DIR)
+        @_data_pool = []
+        load_manifest
+      end
+      
+      def load_manifest
+        @manifest = if File.exist?(MANIFEST_FILE)
+          YAML.load_file(MANIFEST_FILE) || {}
+        else
+          { 'version' => CACHE_VERSION, 'entries' => {} }
+        end
+        
+        # Clear cache if version mismatch
+        if @manifest['version'] != CACHE_VERSION
+          clear_cache
+          @manifest = { 'version' => CACHE_VERSION, 'entries' => {} }
+        end
+      end
+      
+      def save_manifest
+        File.write(MANIFEST_FILE, @manifest.to_yaml)
+      end
+      
+      def manage_data_pool
+        if @_data_pool.size > MAX_DATA_POOL_SIZE
+          # Keep the most recent half
+          @_data_pool = @_data_pool.last(MAX_DATA_POOL_SIZE / 2)
+        end
+      end
+      
+      def make_pixbuf_from_pixels(src_pixbuf, pixels_str)
+        bin = pixels_str.dup
+        bin.force_encoding('ASCII-8BIT')
+        @_data_pool << bin
+        manage_data_pool
+        GdkPixbuf::Pixbuf.new(
+          data: bin,
+          colorspace: src_pixbuf.colorspace,
+          has_alpha: src_pixbuf.has_alpha?,
+          bits_per_sample: src_pixbuf.bits_per_sample,
+          width: src_pixbuf.width,
+          height: src_pixbuf.height,
+          rowstride: src_pixbuf.rowstride
+        )
+      end
+
+      # Main entry point - get an icon variant
+      def get_icon(base_map, icon_num, variant_string)
+        cache_key = build_cache_key(base_map, icon_num, variant_string)
+        cache_path = File.join(CACHE_DIR, "#{cache_key}.png")
+        
+        # Return cached if exists
+        if File.exist?(cache_path)
+          begin
+            return GdkPixbuf::Pixbuf.new(file: cache_path)
+          rescue => e
+            BarBar.log(:warn, "Failed to load cached variant #{cache_path}: #{e}")
+            File.delete(cache_path) rescue nil
+          end
+        end
+        
+        # Generate variant
+        generate_variant(base_map, icon_num, variant_string, cache_path)
+      end
+      
+      # Pre-generate all variants needed by current configuration
+      def pregenerate_all(button_configs)
+        initialize_cache
+        count = 0
+        errors = []
+        
+        button_configs.each do |key, cfg|
+          next unless cfg['image']
+          
+          states = cfg['states'] || {}
+          states.each do |state_name, state_cfg|
+            variant = state_cfg['variant'] || ''
+            next if variant.empty?
+            
+            icon_num = state_cfg['icon'] || 1
+            
+            begin
+              get_icon(cfg['image'], icon_num, variant)
+              count += 1
+            rescue => e
+              errors << "#{key}/#{state_name}: #{e.message}"
+            end
+          end
+        end
+        
+        save_manifest
+        BarBar.log(:info, "Pre-generated #{count} icon variants")
+        BarBar.log(:error, "Variant generation errors: #{errors.join(', ')}") unless errors.empty?
+        
+        { generated: count, errors: errors }
+      end
+      
+      # Clear all cached variants
+      def clear_cache
+        if Dir.exist?(CACHE_DIR)
+          Dir.glob(File.join(CACHE_DIR, '*.png')).each { |f| File.delete(f) rescue nil }
+        end
+        @manifest = { 'version' => CACHE_VERSION, 'entries' => {} }
+        save_manifest
+        BarBar.log(:info, "Variant cache cleared")
+      end
+      
+      # Get cache statistics
+      def cache_stats
+        return { count: 0, size: 0 } unless Dir.exist?(CACHE_DIR)
+        
+        files = Dir.glob(File.join(CACHE_DIR, '*.png'))
+        size = files.sum { |f| File.size(f) rescue 0 }
+        
+        { count: files.size, size: size, size_mb: (size / 1024.0 / 1024.0).round(2) }
+      end
+      
+      private
+      
+      def build_cache_key(base_map, icon_num, variant_string)
+        # Remove file extension if present
+        base_name = File.basename(base_map, '.*')
+        
+        # Parse variant string
+        code = parse_variant_code(variant_string)
+        
+        "#{base_name}_#{icon_num}_#{code}"
+      end
+      
+      def parse_variant_code(variant_string)
+        return 'base' if variant_string.nil? || variant_string.empty?
+        
+        parts = []
+        
+        # Check for grayscale (now 'gs' instead of single letter)
+        parts << 'gs' if variant_string.include?('gs')
+        
+        # Check for gradient (cg_RRGGBB_RRGGBB)
+        if variant_string =~ /cg_([0-9a-fA-F]{6})_([0-9a-fA-F]{6})/
+          parts << "cg_#{$1.downcase}_#{$2.downcase}"
+        # Check for solid color (c_RRGGBB)
+        elsif variant_string =~ /c_([0-9a-fA-F]{6})/
+          parts << "c_#{$1.downcase}"
+        end
+        
+        # Check for border width (bw_N)
+        if variant_string =~ /bw_(\d+)/
+          parts << "bw_#{$1}"
+        end
+        
+        parts.empty? ? 'base' : parts.join('_')
+      end
+      
+      def generate_variant(base_map, icon_num, variant_string, cache_path)
+        # Load base sprite map
+        sprite_file = File.join(ICON_FOLDER, "#{base_map}.png")
+        unless File.exist?(sprite_file)
+          raise "Sprite map not found: #{sprite_file}"
+        end
+        
+        sprite = GdkPixbuf::Pixbuf.new(file: sprite_file)
+        
+        # Calculate icon position in sprite map
+        sprite_width = sprite.width
+        icons_per_row = sprite_width / ICON_WIDTH
+        
+        idx = icon_num.to_i - 1
+        col = idx % icons_per_row
+        row = idx / icons_per_row
+        
+        # Validate position
+        max_rows = sprite.height / ICON_HEIGHT
+        if row >= max_rows || col >= icons_per_row
+          raise "Icon #{icon_num} out of bounds for sprite map #{base_map}"
+        end
+        
+        # Extract base icon
+        icon = sprite.subpixbuf(
+          col * ICON_WIDTH,
+          row * ICON_HEIGHT,
+          ICON_WIDTH,
+          ICON_HEIGHT
+        )
+        
+        # Apply variants
+        processed = apply_variants(icon, variant_string)
+        
+        # Save to cache
+        FileUtils.mkdir_p(File.dirname(cache_path))
+        processed.save(cache_path, 'png')
+        
+        # Update manifest
+        @manifest['entries'][cache_path] = {
+          'base_map' => base_map,
+          'icon_num' => icon_num,
+          'variant' => variant_string,
+          'created' => Time.now.to_i
+        }
+        save_manifest
+        
+        processed
+      end
+      
+      def apply_variants(pixbuf, variant_string)
+        return pixbuf if variant_string.nil? || variant_string.empty?
+        
+        result = pixbuf
+        
+        # Apply grayscale first if needed
+        if variant_string.include?('gs')
+          result = apply_grayscale(result)
+        end
+        
+        # Extract border width if specified
+        border_width = DEFAULT_BORDER_WIDTH
+        if variant_string =~ /bw_(\d+)/
+          border_width = $1.to_i.clamp(MIN_BORDER_WIDTH, MAX_BORDER_WIDTH)
+        end
+        
+        # Then apply border if color is specified
+        if variant_string =~ /cg_([0-9a-fA-F]{6})_([0-9a-fA-F]{6})/
+          # Gradient border
+          hex_color = "#{$1}_#{$2}"
+          result = apply_border(result, hex_color, border_width)
+        elsif variant_string =~ /c_([0-9a-fA-F]{6})/
+          # Solid border
+          hex_color = $1
+          result = apply_border(result, hex_color, border_width)
+        end
+        
+        result
+      end
+
+      def byte_get(buf, idx)
+        buf.is_a?(String) ? buf.getbyte(idx) : buf[idx]
+      end
+
+      def byte_set(buf, idx, val)
+        if buf.is_a?(String)
+          buf.setbyte(idx, val)
+        else
+          buf[idx] = val
+        end
+      end
+
+      def copy_span(dst, dst_off, src, src_off, len)
+        i = 0
+        while i < len
+          byte_set(dst, dst_off + i, byte_get(src, src_off + i))
+          i += 1
+        end
+      end
+      
+      def to_tight_bytes(src)
+        n = src.n_channels
+        w = src.width
+        h = src.height
+        tight = w * n
+        s_stride = src.rowstride
+        s = src.pixels
+
+        out = "\x00" * (tight * h)
+        h.times do |y|
+          copy_span(out, y * tight, s, y * s_stride, tight)
+        end
+        [out, w, h, n, src.colorspace, src.has_alpha?, src.bits_per_sample]
+      end
+
+      def ensure_tight(src)
+        n = src.n_channels
+        w = src.width
+        h = src.height
+        tight = w * n
+
+        # If already tight, nothing to do
+        return src if src.rowstride == tight
+
+        dst = GdkPixbuf::Pixbuf.new(src.colorspace, src.has_alpha?, src.bits_per_sample, w, h)
+        s = src.pixels
+        d = dst.pixels
+        s_stride = src.rowstride
+        d_stride = dst.rowstride
+        row_len = tight
+
+        h.times do |y|
+          copy_span(d, y * d_stride, s, y * s_stride, row_len)
+        end
+        dst
+      end
+
+      def make_pixbuf_from_tight_bytes(w, h, n, colorspace, has_alpha, bps, bytestr)
+        @_data_pool ||= []
+        bin = bytestr.dup
+        bin.force_encoding('ASCII-8BIT')
+        @_data_pool << bin
+        manage_data_pool
+
+        GdkPixbuf::Pixbuf.new(
+          data: bin,
+          colorspace: colorspace,
+          has_alpha: has_alpha,
+          bits_per_sample: bps,
+          width: w,
+          height: h,
+          rowstride: w * n
+        )
+      end
+
+      def apply_grayscale(pixbuf)
+        bytes, w, h, n, cs, has_a, bps = to_tight_bytes(pixbuf)
+        tight = w * n
+        has_alpha = (n > 3)
+
+        h.times do |y|
+          row = y * tight
+          w.times do |x|
+            off = row + x * n
+            r = byte_get(bytes, off)
+            g = byte_get(bytes, off + 1)
+            b = byte_get(bytes, off + 2)
+            gray = (0.299 * r + 0.587 * g + 0.114 * b).to_i
+            byte_set(bytes, off,     gray)
+            byte_set(bytes, off + 1, gray)
+            byte_set(bytes, off + 2, gray)
+            # alpha left as-is (off+3) if present
+          end
+        end
+
+        make_pixbuf_from_tight_bytes(w, h, n, cs, has_a, bps, bytes)
+      end
+
+      def hex_to_rgb(hex_string)
+        # Ensure 6 character hex
+        hex = hex_string.downcase
+        return [0, 255, 0] unless hex =~ /^[0-9a-f]{6}$/
+        
+        r = hex[0..1].to_i(16)
+        g = hex[2..3].to_i(16)
+        b = hex[4..5].to_i(16)
+        [r, g, b]
+      end
+
+      def apply_border(pixbuf, hex_color, border_width = nil)
+        # Parse hex_color which might be "RRGGBB" or "RRGGBB_RRGGBB" for gradient
+        colors = hex_color.split('_')
+        start_rgb = hex_to_rgb(colors[0])
+        end_rgb = colors[1] ? hex_to_rgb(colors[1]) : start_rgb
+        is_gradient = colors.length > 1
+        
+        base_bytes, w, h, n, cs, has_a, bps = to_tight_bytes(pixbuf)
+        tight = w * n
+        has_alpha = (n > 3)
+        bw = border_width || DEFAULT_BORDER_WIDTH
+
+        # start from a copy of the base image
+        out = base_bytes.dup
+
+        # build solid mask from alpha (or everything solid if no alpha)
+        solid = Array.new(h) { Array.new(w, true) }
+        if has_alpha
+          h.times do |y|
+            row = y * tight
+            w.times do |x|
+              a = byte_get(base_bytes, row + x * n + 3)
+              solid[y][x] = a && a > 0
+            end
+          end
+        end
+
+        neighbors = [[-1,0],[1,0],[0,-1],[0,1],[-1,-1],[1,1],[-1,1],[1,-1]]
+
+        # edge detection + draw inward border
+        h.times do |y|
+          row = y * tight
+          w.times do |x|
+            next unless solid[y][x]
+            edge = false
+            neighbors.each do |dx, dy|
+              nx = x + dx; ny = y + dy
+              if nx < 0 || ny < 0 || nx >= w || ny >= h || !solid[ny][nx]
+                edge = true; break
+              end
+            end
+            next unless edge
+
+            (0...bw).each do |dpx|
+              neighbors.each do |dx, dy|
+                px = x + dx * dpx
+                py = y + dy * dpx
+                next if px < 0 || py < 0 || px >= w || py >= h
+                next if has_alpha && !solid[py][px]
+                
+                # Calculate color (gradient or solid)
+                if is_gradient
+                  # Interpolate based on position
+                  t = px.to_f / w.to_f  # Simple left-to-right gradient
+                  r = (start_rgb[0] * (1-t) + end_rgb[0] * t).to_i
+                  g = (start_rgb[1] * (1-t) + end_rgb[1] * t).to_i
+                  b = (start_rgb[2] * (1-t) + end_rgb[2] * t).to_i
+                else
+                  r, g, b = start_rgb
+                end
+                
+                off = py * tight + px * n
+                byte_set(out, off,     r)
+                byte_set(out, off + 1, g)
+                byte_set(out, off + 2, b)
+                # leave alpha channel as-is
+              end
+            end
+          end
+        end
+
+        make_pixbuf_from_tight_bytes(w, h, n, cs, has_a, bps, out)
+      end
+    end
+  end
+end
+
+# Initialize cache on load
+BarBar::Variants.initialize_cache if defined?(Gtk)
+
+class ConfigWindow < Gtk::Window
+  def initialize(config, parent_window = nil, selected_bar_id = nil)
+    @config = config
+    @parent_window = parent_window
+    @bar_tabs = {}
+    @controls = {}
+
+    super()
+    set_title('BarBar Configurator')
+    set_default_size(600, 400)
+    set_keep_above(true)
+    if parent_window
+      set_transient_for(parent_window)
+      set_position(Gtk::WindowPosition::CENTER_ON_PARENT)
+    end
+
+    # Notebook to hold one tab per bar
+    notebook = Gtk::Notebook.new
+
+    @bar_tabs = {} # bar_id => page widget
+
+    icon_page, icon_ctrlls = build_button_manager_tab
+    notebook.append_page(icon_page, Gtk::Label.new('Manage Buttons'))
+
+    browse_page = build_browse_icons_tab
+    notebook.append_page(browse_page, Gtk::Label.new('Browse Icons'))
+    @controls[:icon_manager] = icon_ctrlls
+
+    # For each bar in config, create a tab
+    @config['bars'].each do |bar_cfg|
+      page, ctrls = build_bar_tab(bar_cfg)
+      notebook.append_page(page, Gtk::Label.new(bar_cfg['name']))
+      @bar_tabs[bar_cfg['id']] = page
+      @controls[bar_cfg['id']] = ctrls
+    end
+
+    # "Add Bar" button below
+    add_bar_btn = Gtk::Button.new(label: 'Add Bar')
+    add_bar_btn.signal_connect('clicked') { add_new_bar_tab(notebook) }
+
+    save_all   = Gtk::Button.new(label: 'Save All')
+    cancel_btn = Gtk::Button.new(label: 'Cancel')
+
+    ctrl_box = Gtk::Box.new(:horizontal, 6)
+    ctrl_box.homogeneous = true
+    [add_bar_btn, save_all, cancel_btn].each do |btn|
+      ctrl_box.pack_start(btn, expand: true, fill: true, padding: 4)
+    end
+
+    # pack notebook + button in a VBox
+    vbox = Gtk::Box.new(:vertical, 6)
+    vbox.pack_start(notebook, expand: true, fill: true, padding: 0)
+    vbox.pack_start(add_bar_btn, expand: false, fill: false, padding: 4)
+    vbox.pack_end(ctrl_box, expand: false, fill: false, padding: 4)
+    self.child = vbox
+
+    # on save: pull all fields back into bar_cfg + write YAML + reload
+    save_all.signal_connect('clicked') do
+      @config['bars'].each do |bar_cfg|
+        ctrls = @controls[bar_cfg['id']]
+        bar_cfg['name']      = ctrls[:name_entry].text
+        bar_cfg['enabled']   = ctrls[:enabled_cb].active?
+        bar_cfg['position']  = { 'x' => ctrls[:x_spin].value.to_i, 'y' => ctrls[:y_spin].value.to_i }
+        bar_cfg['size']      = {
+          'cols'      => ctrls[:cols_spin].value.to_i,
+          'rows'      => ctrls[:rows_spin].value.to_i,
+          'icon_size' => ctrls[:isz_spin].value.to_i
+        }
+        bar_cfg['spacing'] = ctrls[:spn_spin].value.to_i
+        bar_cfg['timer_font_size'] = ctrls[:timer_spin].value.to_i if ctrls[:timer_spin]
+        sel = []
+        store = ctrls[:store]
+        store.each do |_, _, iter|
+          key, included = iter[0], iter[1]
+          sel << key if included
+        end
+        bar_cfg['buttons'] = sel
+      end
+
+      # Pre-generate all icon variants
+      button_configs = BarBar.load_button_configs
+      result = BarBar::Variants.pregenerate_all(button_configs)
+
+      # persist & reload all bars
+      File.write(BarBar::CONFIG_FILE, @config.to_yaml)
+      BarBar.initialize
+      destroy
+    end
+
+    cancel_btn.signal_connect('clicked') { destroy }
+
+    show_all
+
+    if selected_bar_id && @bar_tabs.key?(selected_bar_id)
+      page_widget = @bar_tabs[selected_bar_id]
+      idx = notebook.page_num(page_widget)
+      # only set if it's a valid index
+      notebook.current_page = idx if idx && idx >= 0
+    end
+  end
+
+  def set_active_by_text(combo, text)
+    combo.model.each do |_, path, iter|
+      if iter[0] == text
+        combo.active = path.indices.first
+        break
+      end
+    end
+  end
+
+  def rgba_to_hex(rgba)
+    # Convert Gdk::RGBA to hex string (without #)
+    r = (rgba.red * 255).to_i
+    g = (rgba.green * 255).to_i
+    b = (rgba.blue * 255).to_i
+    "%02x%02x%02x" % [r, g, b]
+  end
+
+  def hex_to_rgba(hex_str)
+    # Convert hex string to Gdk::RGBA
+    hex = hex_str.to_s.gsub('#', '')
+    return Gdk::RGBA.new(0, 1, 0, 1) unless hex =~ /^[0-9a-f]{6}$/i
+    
+    r = hex[0..1].to_i(16) / 255.0
+    g = hex[2..3].to_i(16) / 255.0
+    b = hex[4..5].to_i(16) / 255.0
+    Gdk::RGBA.new(r, g, b, 1.0)
+  end
+
+  def build_button_manager_tab
+    # 1) grab all the existing button defs
+    defs     = BarBar.load_button_configs
+    all_keys = defs.keys.sort
+
+    # 2) create main grid
+    grid = Gtk::Grid.new
+    grid.column_spacing = 8
+    grid.row_spacing    = 6
+    grid.margin = 12
+
+    # 3) Row 0: key selector
+    key_sel = Gtk::ComboBoxText.new
+    key_sel.append_text('<< New >>')
+    all_keys.each { |k| key_sel.append_text(k) }
+    key_sel.active = 0
+    grid.attach(Gtk::Label.new('Button Key:'), 0, 0, 1, 1)
+    grid.attach(key_sel, 1, 0, 3, 1)
+
+    # 4) Rows 1–6: basic fields
+    name_e   = Gtk::Entry.new
+    cat_e    = Gtk::Entry.new
+    img_combo = Gtk::ComboBoxText.new
+    [name_e, cat_e, img_combo].each { |w| w.hexpand = true }
+
+    grid.attach(Gtk::Label.new('Name:'),            0, 1, 1, 1); grid.attach(name_e, 1, 1, 3, 1)
+    grid.attach(Gtk::Label.new('Category:'), 0, 2, 1, 1); grid.attach(cat_e, 1, 2, 3, 1)
+    grid.attach(Gtk::Label.new('Image Base:'), 0, 3, 1, 1); grid.attach(img_combo, 1, 3, 3, 1)
+
+    # populate image choices
+    Dir.glob(File.join(BarBar::ICON_FOLDER, '*.png')).each do |f|
+      base = File.basename(f, '.png')
+      img_combo.append_text(base)
+    end
+
+    # 5) Rows 4–10: state-frames in a sub-notebook
+    state_keys = %w[inactive_ready inactive_unready active_ready active_unready]
+    # Calculate total icons based on a 2048x2048 sprite map (32x32 icons)
+    icons_per_row = 2048 / BarBar::ICON_WIDTH
+    total_icons = icons_per_row * icons_per_row
+    state_nb = Gtk::Notebook.new
+    state_widgets = {}
+
+    state_keys.each do |st_key|
+      fg = Gtk::Grid.new
+      fg.row_spacing    = 6
+      fg.column_spacing = 6
+      fg.margin_bottom = 6
+
+      preview = Gtk::Image.new
+      preview.set_size_request(64, 64)
+      fg.attach(preview, 4, 0, 3, 3)
+
+      # Grayscale checkbox
+      gs_check = Gtk::CheckButton.new('Grayscale')
+      fg.attach(gs_check, 0, 0, 1, 1)
+
+      # Border controls row 1
+      border_check = Gtk::CheckButton.new('Apply Border')
+      fg.attach(border_check, 0, 1, 1, 1)
+
+      color_btn = Gtk::ColorButton.new
+      color_btn.set_title("Choose Border Start Color")
+      color_btn.use_alpha = false
+      color_btn.set_rgba(Gdk::RGBA.new(0, 1, 0, 1))
+      fg.attach(Gtk::Label.new('Color:'), 1, 1, 1, 1)
+      fg.attach(color_btn, 2, 1, 1, 1)
+
+      # Border width
+      border_width_spin = Gtk::SpinButton.new(BarBar::MIN_BORDER_WIDTH, BarBar::MAX_BORDER_WIDTH, 1)
+      border_width_spin.value = BarBar::DEFAULT_BORDER_WIDTH
+      fg.attach(Gtk::Label.new('Width:'), 3, 1, 1, 1)
+      fg.attach(border_width_spin, 3, 2, 1, 1)
+
+      # Gradient controls row 2
+      gradient_check = Gtk::CheckButton.new('Gradient')
+      fg.attach(gradient_check, 0, 2, 1, 1)
+
+      color2_btn = Gtk::ColorButton.new
+      color2_btn.set_title("Choose Border End Color")
+      color2_btn.use_alpha = false
+      color2_btn.set_rgba(Gdk::RGBA.new(0, 0, 1, 1))
+      fg.attach(Gtk::Label.new('End:'), 1, 2, 1, 1)
+      fg.attach(color2_btn, 2, 2, 1, 1)
+
+      # Icon number row 3
+      ispin = Gtk::SpinButton.new(1, total_icons, 1)
+      fg.attach(Gtk::Label.new('Icon #:'), 0, 3, 1, 1)
+      fg.attach(ispin, 1, 3, 2, 1)
+
+      cmd_e = Gtk::Entry.new
+      fg.attach(Gtk::Label.new('Command:'),   0, 4, 1, 1)
+      fg.attach(cmd_e,                        1, 4, 54, 1)
+
+      gc_e = Gtk::Entry.new
+      fg.attach(Gtk::Label.new('Group Cmd:'), 0, 5, 1, 1)
+      fg.attach(gc_e,                         1, 5, 54, 1)
+
+      cond_e = Gtk::Entry.new
+      fg.attach(Gtk::Label.new('Condition:'), 0, 6, 1, 1)
+      fg.attach(cond_e,                       1, 6, 54, 1)
+
+      timer_e = Gtk::Entry.new
+      fg.attach(Gtk::Label.new('Timer:'),     0, 7, 1, 1)
+      fg.attach(timer_e,                      1, 7, 54, 1)
+
+      tip_e = Gtk::Entry.new
+      fg.attach(Gtk::Label.new('Tooltip:'),   0, 8, 1, 1)
+      fg.attach(tip_e,                        1, 8, 54, 1)
+
+      frame = Gtk::Frame.new(st_key)
+      frame.add(fg)
+      state_nb.append_page(frame, Gtk::Label.new(st_key))
+
+      state_widgets[st_key] = {
+        grayscale: gs_check,
+        border_enabled: border_check,
+        gradient_enabled: gradient_check,
+        color_button: color_btn,
+        color2_button: color2_btn,
+        border_width: border_width_spin,
+        icon: ispin,
+        command: cmd_e,
+        group_command: gc_e,
+        condition: cond_e,
+        timer: timer_e,
+        tooltip: tip_e,
+        preview: preview
+      }
+
+      # Enable/disable gradient controls based on checkbox
+      gradient_check.signal_connect('toggled') do
+        color2_btn.sensitive = gradient_check.active?
+      end
+      color2_btn.sensitive = false  # Start disabled
+
+      updater = -> {
+        base = img_combo.active_text
+        num = ispin.value_as_int
+        
+        # Build variant string from UI state
+        parts = []
+        parts << 'gs' if gs_check.active?
+        
+        if border_check.active?
+          if gradient_check.active?
+            # Gradient border
+            hex1 = rgba_to_hex(color_btn.rgba)
+            hex2 = rgba_to_hex(color2_btn.rgba)
+            parts << "cg_#{hex1}_#{hex2}"
+          else
+            # Solid border
+            hex = rgba_to_hex(color_btn.rgba)
+            parts << "c_#{hex}"
+          end
+          # Add border width if not default
+          bw = border_width_spin.value.to_i
+          parts << "bw_#{bw}" if bw != BarBar::DEFAULT_BORDER_WIDTH
+        end
+        
+        variant_str = parts.join('_')
+        
+        begin
+          # Use the variant system to get the icon
+          icon = BarBar::Variants.get_icon(base, num, variant_str)
+          thumb = icon.scale_simple(64, 64, GdkPixbuf::InterpType::BILINEAR)
+          preview.set_from_pixbuf(thumb)
+        rescue => e
+          BarBar.log(:debug, "Preview error: #{e}")
+          preview.clear
+        end
+      }
+
+      img_combo.signal_connect('changed') { updater.call }
+      gs_check.signal_connect('toggled') { updater.call }
+      border_check.signal_connect('toggled') { updater.call }
+      gradient_check.signal_connect('toggled') { updater.call }
+      color_btn.signal_connect('color-set') { updater.call }
+      color2_btn.signal_connect('color-set') { updater.call }
+      border_width_spin.signal_connect('value-changed') { updater.call }
+      ispin.signal_connect('value-changed') { updater.call }
+    end
+
+    grid.attach(state_nb, 0, 4, 4, 7)
+
+    save_btn = Gtk::Button.new(label: 'Save Button Definition')
+    grid.attach(save_btn, 0, 11, 4, 1)
+
+    load_def = lambda do |selected_key|
+      data = defs[selected_key] || {}
+      name_e.text  = data['name'].to_s
+      cat_e.text   = Array(data['category']).join(', ')
+      set_active_by_text(img_combo, data['image'].to_s)
+      state_widgets.each do |st, w|
+        sd = data.dig('states', st.to_s) || {}
+        w[:condition].text = sd['condition'].to_s
+        
+        # Parse variant string into components
+        variant = sd['variant'].to_s
+        w[:grayscale].active = variant.include?('gs')
+        
+        # Check for gradient
+        if variant =~ /cg_([0-9a-f]{6})_([0-9a-f]{6})/i
+          w[:border_enabled].active = true
+          w[:gradient_enabled].active = true
+          w[:color_button].set_rgba(hex_to_rgba($1))
+          w[:color2_button].set_rgba(hex_to_rgba($2))
+        # Check for solid color
+        elsif variant =~ /c_([0-9a-f]{6})/i
+          w[:border_enabled].active = true
+          w[:gradient_enabled].active = false
+          w[:color_button].set_rgba(hex_to_rgba($1))
+        else
+          w[:border_enabled].active = false
+          w[:gradient_enabled].active = false
+        end
+        
+        # Check for border width
+        if variant =~ /bw_(\d+)/
+          w[:border_width].value = $1.to_i
+        else
+          w[:border_width].value = BarBar::DEFAULT_BORDER_WIDTH
+        end
+        
+        w[:color2_button].sensitive = w[:gradient_enabled].active?
+        
+        w[:icon].value         = sd['icon'].to_i
+        w[:tooltip].text       = sd['tooltip'].to_s
+        w[:timer].text         = sd['timer'].to_s
+        w[:command].text       = sd['command'].to_s
+        w[:group_command].text = sd['group_command'].to_s
+      end
+    end
+
+    key_sel.signal_connect('changed') { load_def.call(key_sel.active_text) }
+    load_def.call(key_sel.active_text)
+
+    save_btn.signal_connect('clicked') do
+      key = key_sel.active_text
+      if key == '<< New >>'
+        key = name_e.text.strip.downcase.gsub(/\s+/, '_')
+        defs[key] = {}
+        key_sel.append_text(key)
+      end
+
+      # build up the hash
+      states_hash = state_widgets.each_with_object({}) do |(st, w), h|
+        # Build variant string from components
+        parts = []
+        parts << 'gs' if w[:grayscale].active?
+        
+        if w[:border_enabled].active?
+          if w[:gradient_enabled].active?
+            # Gradient border
+            hex1 = rgba_to_hex(w[:color_button].rgba)
+            hex2 = rgba_to_hex(w[:color2_button].rgba)
+            parts << "cg_#{hex1}_#{hex2}"
+          else
+            # Solid border
+            hex = rgba_to_hex(w[:color_button].rgba)
+            parts << "c_#{hex}"
+          end
+          # Add border width if not default
+          bw = w[:border_width].value.to_i
+          parts << "bw_#{bw}" if bw != BarBar::DEFAULT_BORDER_WIDTH
+        end
+        
+        variant_str = parts.join('_')
+        
+        h[st.to_s] = {
+          'variant'       => variant_str,
+          'icon'          => w[:icon].value.to_i,
+          'command'       => w[:command].text,
+          'group_command' => w[:group_command].text,
+          'condition'     => w[:condition].text,
+          'timer'         => w[:timer].text,
+          'tooltip'       => w[:tooltip].text
+        }
+      end
+
+      defs[key] = {
+        'name'     => name_e.text,
+        'category' => cat_e.text.split(',').map(&:strip),
+        'image'    => img_combo.active_text,
+        'states'   => states_hash
+      }
+
+      BarBar.instance_variable_set(:@button_configs, defs)
+      BarBar.save_button_configs
+      set_active_by_text(key_sel, key)
+    end
+
+    # return the tab page + controls if you need them
+    [grid, { selector: key_sel }]
+  end
+
+  def build_browse_icons_tab
+    # Only show base sprite maps (no variants)
+    images = Dir.glob(File.join(BarBar::ICON_FOLDER, '*.png'))
+                .map { |f| File.basename(f, '.png') }
+                .reject { |f| f.include?('_green') || f.include?('_blue') || 
+                             f.include?('_red') || f.include?('_greyscale') || 
+                             f.include?('_grayscale') }
+                .uniq
+                .sort
+
+    # layout
+    vbox = Gtk::Box.new(:vertical, 6)
+    vbox.margin = 12
+
+    # row selector & image dropdown
+    ctrl = Gtk::Box.new(:horizontal, 6)
+    img_combo = Gtk::ComboBoxText.new
+    images.each { |img| img_combo.append_text(img) }
+    img_combo.active = 0
+    ctrl.pack_start(Gtk::Label.new('Sprite Map:'), expand: false, fill: false, padding: 0)
+    ctrl.pack_start(img_combo, expand: false, fill: false, padding: 0)
+
+    max_rows = 32  # Default for 2048x2048, will be updated
+    row_spin = Gtk::SpinButton.new(1, max_rows, 1)
+    ctrl.pack_start(Gtk::Label.new('Row:'), expand: false, fill: false, padding: 0)
+    ctrl.pack_start(row_spin, expand: false, fill: false, padding: 0)
+
+    range_lbl = Gtk::Label.new('')
+    ctrl.pack_start(range_lbl, expand: true, fill: true, padding: 0)
+
+    vbox.pack_start(ctrl, expand: false, fill: false, padding: 0)
+
+    # scrollable grid
+    scroll = Gtk::ScrolledWindow.new
+    scroll.set_policy(:automatic, :automatic)
+    grid = Gtk::Grid.new
+    grid.row_spacing    = 4
+    grid.column_spacing = 4
+    scroll.add(grid)
+    vbox.pack_start(scroll, expand: true, fill: true, padding: 0)
+
+    # helper to render one row of icons
+    render = lambda do
+      grid.each { |c| grid.remove(c) }
+      base = img_combo.active_text
+      return unless base
+      file = File.join(BarBar::ICON_FOLDER, "#{base}.png")
+      unless File.exist?(file)
+        range_lbl.text = "File not found: #{base}.png"
+        return
+      end
+      begin
+        pix = GdkPixbuf::Pixbuf.new(file: file)
+        icons_per_row = pix.width / BarBar::ICON_WIDTH
+        max_rows = pix.height / BarBar::ICON_HEIGHT
+        row  = row_spin.value_as_int - 1
+        start = row * icons_per_row
+
+        icons_per_row.times do |i|
+          sub = pix.subpixbuf(i * BarBar::ICON_WIDTH, row * BarBar::ICON_HEIGHT,
+                              BarBar::ICON_WIDTH, BarBar::ICON_HEIGHT)
+          thumb = sub.scale_simple(75, 75, GdkPixbuf::InterpType::BILINEAR)
+          eb = Gtk::EventBox.new.add(Gtk::Image.new(pixbuf: thumb))
+          grid.attach(eb, i % 8, i / 8, 1, 1)
+        end
+
+        range_lbl.text = "Icons #{start + 1}–#{start + icons_per_row}"
+        grid.show_all
+      rescue => e
+        range_lbl.text = "Error loading #{base}.png: #{e.message}"
+      end
+    end
+
+    img_combo.signal_connect('changed') { render.call }
+    row_spin.signal_connect('value-changed') { render.call }
+    render.call
+
+    vbox
+  end
+
+  # Build one tab's content for editing a single bar
+  def build_bar_tab(bar_cfg)
+    grid = Gtk::Grid.new
+    grid.column_spacing = 8
+    grid.row_spacing = 6
+    grid.set_margin_top(12)
+    grid.set_margin_bottom(12)
+    grid.set_margin_start(12)
+    grid.set_margin_end(12)
+
+    # Name
+    grid.attach(Gtk::Label.new('Name:'), 0, 0, 1, 1)
+    name_entry = Gtk::Entry.new
+    name_entry.text = bar_cfg['name']
+    grid.attach(name_entry, 1, 0, 2, 1)
+
+    # Enabled
+    enabled_cb = Gtk::CheckButton.new
+    enabled_cb.label = 'Enabled'
+    enabled_cb.active = bar_cfg['enabled']
+    grid.attach(enabled_cb, 0, 1, 1, 1)
+
+    # Position
+    grid.attach(Gtk::Label.new('X:'), 0, 2, 1, 1)
+    x_spin = Gtk::SpinButton.new(0, 5000, 1)
+    x_spin.value = bar_cfg.dig('position', 'x') || 100
+    grid.attach(x_spin, 1, 2, 1, 1)
+
+    grid.attach(Gtk::Label.new('Y:'), 2, 2, 1, 1)
+    y_spin = Gtk::SpinButton.new(0, 5000, 1)
+    y_spin.value = bar_cfg.dig('position', 'y') || 100
+    grid.attach(y_spin, 3, 2, 1, 1)
+
+    # Size: cols, rows, icon_size, spacing
+    grid.attach(Gtk::Label.new('Cols:'), 0, 3, 1, 1)
+    cols_spin = Gtk::SpinButton.new(1, 20, 1)
+    cols_spin.value = bar_cfg.dig('size', 'cols') || 10
+    grid.attach(cols_spin, 1, 3, 1, 1)
+
+    grid.attach(Gtk::Label.new('Rows:'), 2, 3, 1, 1)
+    rows_spin = Gtk::SpinButton.new(1, 10, 1)
+    rows_spin.value = bar_cfg.dig('size', 'rows') || 1
+    grid.attach(rows_spin, 3, 3, 1, 1)
+
+    grid.attach(Gtk::Label.new('Icon Size:'), 0, 4, 1, 1)
+    isz_spin = Gtk::SpinButton.new(16, 128, 1)
+    isz_spin.value = bar_cfg.dig('size', 'icon_size') || 64
+    grid.attach(isz_spin, 1, 4, 1, 1)
+
+    grid.attach(Gtk::Label.new('Spacing:'), 2, 4, 1, 1)
+    spn_spin = Gtk::SpinButton.new(0, 20, 1)
+    spn_spin.value = bar_cfg['spacing'] || 2
+    grid.attach(spn_spin, 3, 4, 1, 1)
+
+    # Timer font size
+    grid.attach(Gtk::Label.new('Timer Font:'), 0, 5, 1, 1)
+    timer_spin = Gtk::SpinButton.new(8, 48, 1)
+    timer_spin.value = bar_cfg['timer_font_size'] || bar_cfg.dig('size', 'icon_size').to_i / 2
+    grid.attach(timer_spin, 1, 5, 1, 1)
+
+    # Category filter
+    defs       = BarBar.load_button_configs
+    categories = defs.values.flat_map { |cfg| Array(cfg['category']) }.compact.uniq.sort
+
+    combo = Gtk::ComboBoxText.new
+    combo.append_text('All')
+    categories.each { |cat| combo.append_text(cat) }
+    combo.active = 0
+
+    grid.attach(Gtk::Label.new('Category:'), 0, 6, 1, 1)
+    grid.attach(combo, 1, 6, 3, 1)
+
+    # Button Picker
+    all_keys = defs.keys.sort
+    store = Gtk::ListStore.new(String, FalseClass)
+    all_keys.each do |k|
+      iter = store.append
+      iter[0] = k
+      iter[1] = bar_cfg['buttons'].include?(k)
+    end
+
+    combo.signal_connect('changed') do |c|
+      selected = c.active_text
+      store.clear
+      all_keys.each do |k|
+        cfg = defs[k]
+        next if selected != 'All' && !Array(cfg['category']).include?(selected)
+        iter = store.append
+        iter[0], iter[1] = k, bar_cfg['buttons'].include?(k)
+      end
+    end
+
+    tv = Gtk::TreeView.new(store)
+    renderer_text = Gtk::CellRendererText.new
+    col_text = Gtk::TreeViewColumn.new('Button', renderer_text, text: 0)
+    tv.append_column(col_text)
+    renderer_toggle = Gtk::CellRendererToggle.new
+    toggle_col = Gtk::TreeViewColumn.new('Include', renderer_toggle, active: 1)
+    renderer_toggle.signal_connect('toggled') do |_, path|
+      iter = store.get_iter(path)
+      iter[1] = !iter[1]
+    end
+    tv.append_column(toggle_col)
+    sel    = tv.selection
+    up_btn = Gtk::Button.new(label: '↑')
+    dn_btn = Gtk::Button.new(label: '↓')
+
+    up_btn.signal_connect('clicked') do
+      if (iter = sel.selected)
+        path = store.get_path(iter)
+        idx  = path.indices[0]
+        if idx > 0
+          above = store.iter_nth_child(nil, idx - 1)
+          swap_rows(store, iter, above)
+          sel.select_path(store.get_path(above))
+        end
+      end
+    end
+
+    dn_btn.signal_connect('clicked') do
+      if (iter = sel.selected)
+        path = store.get_path(iter)
+        idx = path.indices[0]
+        total = store.iter_n_children(nil)
+        if idx < total - 1
+          below = store.iter_nth_child(nil, idx + 1)
+          swap_rows(store, iter, below)
+          sel.select_path(store.get_path(below))
+        end
+      end
+    end
+
+    scroll = Gtk::ScrolledWindow.new
+    scroll.set_policy(:automatic, :automatic)
+    scroll.set_min_content_height(200)
+    scroll.set_vexpand(true)
+    scroll.add(tv)
+
+    hbox = Gtk::Box.new(:horizontal, 4)
+    hbox.pack_start(scroll, expand: true, fill: true, padding: 0)
+
+    btn_box = Gtk::Box.new(:vertical, 2)
+    btn_box.pack_start(up_btn, expand: false, fill: false, padding: 2)
+    btn_box.pack_start(dn_btn, expand: false, fill: false, padding: 2)
+    hbox.pack_start(btn_box, expand: false, fill: false, padding: 0)
+
+    grid.attach(hbox, 0, 7, 4, 4)
+
+    ctrls = {
+      name_entry: name_entry,
+      enabled_cb: enabled_cb,
+      x_spin: x_spin,
+      y_spin: y_spin,
+      cols_spin: cols_spin,
+      rows_spin: rows_spin,
+      isz_spin: isz_spin,
+      spn_spin: spn_spin,
+      timer_spin: timer_spin,
+      store: store
+    }
+
+    [grid, ctrls]
+  end
+
+  # Add a brand-new empty bar
+  def add_new_bar_tab(notebook)
+    new_id = "bar#{Time.now.to_i}"
+    pos = if @parent_window
+            x, y = @parent_window.position
+            { 'x' => x, 'y' => y }
+          else
+            { 'x' => 100, 'y' => 100 }
+          end
+
+    new_bar = {
+      'id'       => new_id,
+      'name'     => 'New Bar',
+      'enabled'  => true,
+      'position' => pos,
+      'size'     => { 'cols' => 10, 'rows' => 1, 'icon_size' => 64 },
+      'spacing'  => 2,
+      'buttons'  => []
+    }
+    @config['bars'] << new_bar
+    page, ctrls = build_bar_tab(new_bar)
+    @bar_tabs[new_id] = page
+    @controls[new_id] = ctrls
+    notebook.append_page(page, Gtk::Label.new(new_bar['name']))
+    show_all
+  end
+
+  private
+
+  def swap_rows(store, iter1, iter2)
+    (0...store.n_columns).each do |col|
+      v1 = store.get_value(iter1, col)
+      v2 = store.get_value(iter2, col)
+      store.set_value(iter1, col, v2)
+      store.set_value(iter2, col, v1)
+    end
+  end
+end
+
+module BarBar
+  class BarButton
+    attr_reader :key, :cfg, :widget, :image_widget, :timer_label
+    attr_accessor :last_state, :last_timer_value
+
+    @@time_format_cache = {}
+
+    def initialize(key, cfg, icon_width, icon_height, spacing, timer_size = nil)
+      @key = key
+      @cfg = cfg
+      @icon_width = icon_width
+      @icon_height = icon_height
+      @spacing = spacing
+      @timer_size = timer_size
+      @last_state = nil
+      @last_timer_value = nil
+      @cached_state = nil
+      @cache_time = 0
+
+      build_widget
+    end
+
+    def build_widget
+      # Create the button image
+      @image_widget = BarBar.create_icon(@cfg, :inactive_ready, @icon_width, @icon_height)
+
+      # Create overlay for timer
+      overlay = Gtk::Overlay.new
+      overlay.add(@image_widget)
+
+      # Only create timer label if this button has timer expressions
+      if button_has_timer?
+        @timer_label = Gtk::Label.new("")
+        @timer_label.set_halign(:center)
+        @timer_label.set_valign(:end)
+        @timer_label.style_context.add_class("skillbar-timer")
+        # Apply custom timer size if specified for this bar
+        if @timer_size
+          css = "label { font-size: #{@timer_size}px; }"
+          provider = Gtk::CssProvider.new
+          provider.load(data: css)
+          @timer_label.style_context.add_provider(provider, Gtk::StyleProvider::PRIORITY_APPLICATION)
+        end
+        @timer_label.hide
+        # Make label completely transparent to mouse events
+        if @timer_label.respond_to?(:set_has_window)
+          @timer_label.set_has_window(false)
+        end
+        @timer_label.sensitive = false # Won't receive any events
+        overlay.add_overlay(@timer_label)
+        overlay.set_overlay_pass_through(@timer_label, true) if overlay.respond_to?(:set_overlay_pass_through)
+      else
+        @timer_label = nil
+      end
+
+      # Create the button
+      @widget = Gtk::Button.new
+      @widget.set_relief(:none)
+      @widget.add(overlay)
+      update_tooltip(current_state)
+      @widget.can_focus = false
+
+      # Connect click handler
+      @widget.signal_connect('clicked') { on_click }
+    end
+
+    def button_has_timer?
+      states = @cfg['states'] || {}
+      states.any? { |_, state_cfg| state_cfg['timer'] && !state_cfg['timer'].empty? }
+    end
+
+    def update_tooltip(state)
+      state_cfg = @cfg.dig('states', state.to_s) || {}
+      tooltip = state_cfg['tooltip'] || @cfg['name']
+      @widget.tooltip_text = tooltip if @widget.tooltip_text != tooltip
+    end
+
+    def on_click
+      state = current_state
+      state_cfg = @cfg.dig('states', state.to_s) || {}
+
+      if (cmd = state_cfg['command']) && !cmd.empty?
+        # Check if it's a simple command or needs evaluation
+        if cmd.include?('#{') || cmd.include?('<%')
+          # Needs interpolation - compile and execute
+          proc = BarBar.compile_expression("\"#{cmd}\"")
+          actual_cmd = proc.call if proc
+        else
+          # Simple string command
+          actual_cmd = cmd
+        end
+
+        if actual_cmd
+          do_client(actual_cmd)
+          puts("> #{actual_cmd}")
+        end
+        BarBar.log(:debug, "Button #{@key} clicked, executing: #{cmd}")
+      end
+
+      # Focus game window after click
+      Frontend.refocus_callback.call if defined?(Frontend) && !Frontend.pid.nil?
+    end
+
+    def current_state(force_refresh = false)
+      # Cache state for 100ms to reduce evaluations
+      now = Time.now.to_f
+
+      if !force_refresh && @cached_state && (now - @cache_time < 0.1)
+        return @cached_state
+      end
+
+      state = BarBar.determine_state(@cfg)
+      @cached_state = state
+      @cache_time = now
+      state
+    end
+
+    def update
+      state = current_state
+      state_changed = false
+
+      if state != @last_state
+        new_image = BarBar.create_icon(@cfg, state, @icon_width, @icon_height)
+        @image_widget.set_from_pixbuf(new_image.pixbuf)
+        update_tooltip(state)
+        @last_state = state
+        state_changed = true
+      end
+
+      timer_value = update_timer(state)
+      { timer: timer_value, changed: state_changed || timer_value != @last_timer_value }
+    end
+
+    def update_timer(state)
+      return nil unless BarBar.show_timers?
+      return nil if !@timer_label || @timer_label.destroyed?
+
+      state_cfg = @cfg.dig('states', state.to_s) || {}
+      timer_value = nil
+
+      if (expr = state_cfg['timer'])
+        proc = BarBar.compile_expression(expr)
+        if proc
+          timer_value = begin
+            raw = proc.call
+            Array(raw).first.to_i
+          rescue => e
+            BarBar.log(:error, "Timer execution error for #{@key}: #{e}")
+            0
+          end
+        end
+      end
+
+      # Only update if timer value changed
+      if timer_value != @last_timer_value
+        @last_timer_value = timer_value
+        return timer_value if @timer_label.destroyed?
+
+        if timer_value && timer_value > 0
+          @timer_label.text = format_time(timer_value)
+          @timer_label.visible = true if !@timer_label.visible?
+        else
+          @timer_label.text = ""
+          @timer_label.visible = false if @timer_label.visible?
+        end
+      end
+      timer_value
+    end
+
+    def format_time(seconds)
+      return @@time_format_cache[seconds] if @@time_format_cache[seconds]
+
+      result =
+        case seconds
+        when 0...100
+          "#{seconds}s"
+        when 100...5940
+          "#{(seconds / 60.0).round}m"
+        else
+          "#{(seconds / 3600.0).round}h"
+        end
+      @@time_format_cache[seconds] = result if seconds % 5 == 0 || seconds < 20
+      result
+    end
+
+    def destroy
+      # Mark as destroyed first
+      @destroyed = true
+
+      # Clean up widget references
+      @timer_label = nil
+      @image_widget = nil
+
+      # Destroy the main widget
+      @widget.destroy if @widget
+      @widget = nil
+
+      # Clear cached state
+      @cached_state = nil
+    end
+
+    def destroyed?
+      @destroyed || (@widget && @widget.destroyed?)
+    end
+  end
+end
+
+module BarBar
+  class BarWindow
+    def initialize(bar_cfg)
+      @cfg         = bar_cfg
+      @cols        = bar_cfg.dig('size', 'cols')       || 1
+      @rows        = bar_cfg.dig('size', 'rows')       || 1
+      @disp_icon_w = bar_cfg.dig('size', 'icon_size')  || ICON_WIDTH
+      @spacing     = bar_cfg['spacing']               || 0
+      @keys        = bar_cfg['buttons']               || []
+
+      build_window
+      build_buttons
+      start_timer
+    end
+
+    def build_window
+      @win = Gtk::Window.new(@cfg['name'] || 'Bar')
+      @win.set_app_paintable(true)
+      @win.accept_focus = false
+      @win.focus_on_map = false
+      @win.override_background_color(:normal, Gdk::RGBA.parse("rgba(0,0,0,0)"))
+      ws = @cfg['window'] || {}
+      default_w = @cols * @disp_icon_w + (@cols - 1) * @spacing
+      default_h = @rows * @disp_icon_w + (@rows - 1) * @spacing
+      win_w = ws['width'] || default_w
+      win_h = ws['height'] || default_h
+      @win.set_default_size(win_w, win_h)
+      if (p = @cfg['position'])
+        @win.move(p['x'], p['y']) if p['x'] && p['y']
+      end
+      atop = @cfg.dig('window', 'always_on_top')
+      @win.decorated = @cfg.dig('window', 'decorated').nil? ? true : @cfg['window']['decorated']
+      @win.set_keep_above(atop.nil? ? true : atop)
+
+      @last_click_pos = nil
+      menu = Gtk::Menu.new
+
+      config_item = Gtk::MenuItem.new(label: 'Configure BarBar')
+      config_item.signal_connect('activate') do
+        ConfigWindow.new(BarBar.config, @win, @cfg['id'])
+      end
+      menu.append(config_item)
+
+      toggle_border = Gtk::MenuItem.new(label: 'Toggle Window Border')
+      toggle_border.signal_connect('activate') { toggle_decorations }
+      menu.append(toggle_border)
+
+      top_item = Gtk::CheckMenuItem.new(label: 'Always on top')
+      top_item.active = (@cfg.dig('window', 'always_on_top').nil? ? true : @cfg['window']['always_on_top'])
+      top_item.signal_connect('toggled') do
+        @win.set_keep_above(top_item.active?)
+        @cfg['window']['always_on_top'] = top_item.active?
+        BarBar.save_window_settings(@cfg, @win)
+      end
+      menu.append(top_item)
+
+      dark_item = Gtk::CheckMenuItem.new(label: 'Dark Mode')
+      dark_item.active = BarBar.class_variable_get(:@@config).fetch('dark_mode', false)
+      dark_item.signal_connect('toggled') do
+        BarBar.class_variable_get(:@@config)['dark_mode'] = dark_item.active?
+        File.write(BarBar::CONFIG_FILE, BarBar.class_variable_get(:@@config).to_yaml)
+        BarBar.apply_css
+      end
+      menu.append(dark_item)
+
+      timer_item = Gtk::CheckMenuItem.new(label: 'Show Timers')
+      timer_item.active = BarBar.show_timers?
+      timer_item.signal_connect('toggled') do
+        BarBar.class_variable_get(:@@config)['show_timers'] = timer_item.active?
+        File.write(BarBar::CONFIG_FILE, BarBar.class_variable_get(:@@config).to_yaml)
+        BarBar.bar_windows.each do |bw|
+          bw.instance_variable_get(:@buttons).each_value do |info|
+            info[:btn].queue_draw
+          end
+        end
+      end
+      menu.append(timer_item)
+
+      menu.show_all
+      @win.add_events(Gdk::EventMask::BUTTON_PRESS_MASK)
+      @win.signal_connect('button-press-event') do |_, event|
+        if event.button == 3
+          @last_click_pos = [event.x_root.to_i, event.y_root.to_i]
+          menu.popup_at_pointer(event)
+          true
+        else
+          false
+        end
+      end
+
+      @win.signal_connect('delete-event') do |_, _|
+        BarBar.save_window_settings(@cfg, @win)
+        BarBar.request_close
+        true
+      end
+      @win.signal_connect('configure-event') do |w, _event|
+        BarBar.save_window_settings_debounced(@cfg, w)
+        false
+      end
+    end
+
+    def build_buttons
+      scroll = Gtk::ScrolledWindow.new
+      scroll.set_policy(:automatic, :automatic)
+      @win.add(scroll)
+
+      grid = Gtk::Grid.new
+      grid.row_spacing    = @spacing
+      grid.column_spacing = @spacing
+      scroll.add(grid)
+
+      @buttons = {}
+
+      # Get timer font size for this bar (falls back to global or default)
+      timer_size = @cfg.fetch('timer_font_size', nil)
+
+      @keys.each_with_index do |key, idx|
+        next unless (btn_cfg = BarBar.config_for(key))
+
+        # Create BarButton instance
+        button = BarBar::BarButton.new(key, btn_cfg, @disp_icon_w, @disp_icon_w, @spacing, timer_size)
+        @buttons[key] = button
+
+        # Add to grid
+        c = idx % @cols
+        r = idx / @cols
+        grid.attach(button.widget, c, r, 1, 1)
+      end
+
+      @win.show_all
+    end
+
+    def start_timer
+      @next_update_times = {}
+      @timer = GLib::Timeout.add(100) { smart_update_buttons; true }
+    end
+
+    def format_time(sec)
+      case sec
+      when 0...100
+        "#{sec}s"
+      when 100...5940
+        # round to nearest minute
+        minutes = (sec / 60.0).round
+        "#{minutes}m"
+      else
+        # round to nearest hour
+        hours = (sec / 3600.0).round
+        "#{hours}h"
+      end
+    end
+
+    def smart_update_buttons
+      now = Time.now.to_f
+      updates_needed = false
+
+      visible_area = @win.visible? ? @win.allocation : nil
+
+      @buttons.each do |key, button|
+        next if button.destroyed?
+        # Skip if button is scrolled out of view
+        if visible_area && button.widget.allocation
+          btn_alloc = button.widget.allocation
+          next unless btn_alloc.intersect(visible_area)
+        end
+        next_update = @next_update_times[key] || 0
+
+        if now >= next_update
+          # Update the button and get its timer value
+          result = button.update
+          updates_needed = true if result[:changed]
+
+          # Calculate next update based on timer value
+          @next_update_times[key] = now + calculate_update_interval(result[:timer])
+        end
+      end
+      # Force a single redraw after all updates
+      @win.queue_draw if updates_needed
+    end
+
+    def calculate_update_interval(timer_seconds)
+      return 0.25 unless timer_seconds && timer_seconds > 0
+
+      case timer_seconds
+      when 0..15
+        1.0     # Update every second for last 10 seconds
+      when 16..3599
+        5.0     # Update every 5 seconds for under an hour
+      else
+        300.0   # Update every 5 minutes for hours
+      end
+    end
+
+    def destroy
+      # CRITICAL: Remove timer first to prevent callbacks on destroyed widgets
+      GLib::Source.remove(@timer) if @timer
+      @timer = nil
+
+      # Then destroy buttons
+      @buttons.each_value(&:destroy)
+      @buttons.clear
+
+      # Finally destroy window
+      @win.destroy
+    end
+
+    def toggle_decorations
+      BarBar.save_window_settings(@cfg, @win)
+      @cfg['window']['decorated'] = !@win.decorated?
+      File.write(BarBar::CONFIG_FILE, BarBar.class_variable_get(:@@config).to_yaml)
+
+      @win.destroy
+      build_window
+      build_buttons
+      start_timer
+    end
+  end
+end
+
+module BarBar
+  # Top-level kickoff: load bars.yaml (or default), spin up windows
+  def self.initialize
+    @close_window = false
+    Gtk.queue do
+      destroy_window
+      raw = File.exist?(CONFIG_FILE) ? YAML.load_file(CONFIG_FILE) : nil
+      if validate_config(raw)
+        @@config = raw
+        log(:info, "Config loaded successfully")
+      else
+        log(:warn, "Invalid config detected, using defaults")
+        @@config = {
+          'bars' => [
+            {
+              'id' => 'default', 'name' => 'Main Bar', 'enabled' => true,
+              'position' => { 'x' => 100, 'y' => 100 },
+              'size' => { 'cols' => 10, 'rows' => 1, 'icon_size' => 64 },
+              'spacing' => 2, 'buttons' => []
+            }
+          ]
+        }
+      end
+
+      apply_css
+      @@show_timers = @@config.fetch('show_timers', true)
+
+      # build a window per enabled bar
+      @@config['bars'].each do |bar|
+        next unless bar['enabled']
+        @@bar_windows << BarWindow.new(bar)
+      end
+    end
+  end
+end
+
+# finally launch it
+BarBar.initialize
+before_dying do
+  Gtk.queue do
+    # Get windows before destroying them
+    windows = BarBar.class_variable_get(:@@bar_windows)
+
+    # Destroy each window properly
+    windows.each do |window|
+      window.destroy rescue nil
+    end
+
+    # Clear the array
+    windows.clear
+
+    # Clear caches
+    BarBar.clear_pixbuf_cache rescue nil
+  end
+end
+
+until BarBar.close_requested?
+  sleep(1)
+end
+Gtk.queue do
+  BarBar.class_variable_get(:@@bar_windows).each(&:destroy) rescue nil
+end
+exit
