@@ -18,15 +18,17 @@ require 'gtk3'
 require 'yaml'
 
 # Load all the modular components
-Script.run('barbar_constants')
-Script.run('barbar_helpers')
-Script.run('barbar_config_window')
-Script.run('barbar_button')
-Script.run('barbar_bar_window')
+Script.run('barbar_constants') unless defined?(BarBar::ICON_FOLDER)
+Script.run('barbar_helpers') unless defined?(BarBar.load_button_configs)
+Script.run('barbar_variants') unless defined?(BarBar::Variants)
+Script.run('barbar_config_window') unless defined?(BarBar::ConfigWindow)
+Script.run('barbar_button') unless defined?(BarBar::BarButton)
+Script.run('barbar_bar_window') unless defined?(BarBar::BarWindow)
 
 module BarBar
   # Top-level kickoff: load bars.yaml (or default), spin up windows
   def self.initialize
+    @close_window = false
     Gtk.queue do
       destroy_window
       raw = File.exist?(CONFIG_FILE) ? YAML.load_file(CONFIG_FILE) : nil

@@ -5,8 +5,6 @@ module BarBar
   @@save_timer = nil
   @@pixbuf_cache = {}
   @@pixbuf_lru = []
-  @@sprite_cache = {}
-  @@sprite_lru = []
   @@compiled_expressions = {}
   @@expression_lru = []
   @@bar_windows  = []
@@ -96,8 +94,8 @@ module BarBar
   end
 
   def self.clear_pixbuf_cache
-    @@sprite_cache.clear
-    @@sprite_lru.clear
+    @@pixbuf_cache.clear
+    @@pixbuf_lru.clear
   end
 
   def self.manage_cache
@@ -105,37 +103,6 @@ module BarBar
       oldest = @@pixbuf_lru.shift
       @@pixbuf_cache.delete(oldest) if oldest
     end
-  end
-
-  def self.get_sprite_sheet(base, variant)
-    sprite_key = "#{base}#{variant}"
-
-    # Check if we already have this sprite sheet
-    if @@sprite_cache[sprite_key]
-      # Move to end of LRU list (most recently used)
-      @@sprite_lru.delete(sprite_key)
-      @@sprite_lru.push(sprite_key)
-      return @@sprite_cache[sprite_key]
-    end
-
-    # Load the sprite sheet
-    file = File.join(ICON_FOLDER, "#{sprite_key}.png")
-    return nil unless File.exist?(file)
-
-    sprite = GdkPixbuf::Pixbuf.new(file: file)
-
-    # Add to cache and LRU list
-    @@sprite_cache[sprite_key] = sprite
-    @@sprite_lru.push(sprite_key)
-
-    # Evict oldest sprite sheet if cache is too large
-    if @@sprite_lru.size > MAX_SPRITE_CACHE_SIZE
-      oldest = @@sprite_lru.shift
-      @@sprite_cache.delete(oldest)
-      log(:debug, "Evicted sprite sheet: #{oldest}")
-    end
-
-    sprite
   end
 
   def self.create_icon(cfg, state_sym, width = @@disp_icon_w, height = @@disp_icon_h)
@@ -152,39 +119,26 @@ module BarBar
       manage_cache if @@pixbuf_cache.size > MAX_CACHE_SIZE
 
       # Create a unique key for this specific icon
-      key = "#{base}#{variant}_#{icon_num}_#{width}x#{height}"
+      key = "#{base}_#{icon_num}_#{variant}_#{width}x#{height}"
 
       # Check if we have this specific icon cached
       if @@pixbuf_cache[key]
         @@pixbuf_lru.delete(key)
         @@pixbuf_lru.push(key)
       else
-        # Get the sprite sheet (from cache or load it)
-        sprite_sheet = get_sprite_sheet(base, variant)
-        return Gtk::Image.new unless sprite_sheet
-
-        # Calculate position in sprite sheet
-        idx = icon_num - 1
-        cx = idx % ICONS_PER_ROW
-        ry = idx / ICONS_PER_ROW
-
-        # Crop out the specific icon
-        crop = sprite_sheet.subpixbuf(
-          cx * ICON_WIDTH,
-          ry * ICON_HEIGHT,
-          ICON_WIDTH,
-          ICON_HEIGHT
-        )
+        # Get the icon variant (from variant cache or generate)
+        icon = Variants.get_icon(base, icon_num, variant)
+        return Gtk::Image.new unless icon
 
         # Scale if needed
         if width != ICON_WIDTH || height != ICON_HEIGHT
-          @@pixbuf_cache[key] = crop.scale_simple(
+          @@pixbuf_cache[key] = icon.scale_simple(
             width,
             height,
             GdkPixbuf::InterpType::BILINEAR
           )
         else
-          @@pixbuf_cache[key] = crop
+          @@pixbuf_cache[key] = icon
         end
         @@pixbuf_lru.push(key)
         manage_cache
