@@ -34,9 +34,11 @@ module BarBar
   MAX_COMPILED_EXPR_CACHE ||= 100
 
   MAX_DATA_POOL_SIZE ||= 50
-  MAX_BORDER_WIDTH ||= 5
+  MAX_BORDER_WIDTH ||= 10
   MIN_BORDER_WIDTH ||= 1
   DEFAULT_BORDER_WIDTH ||= 2
+
+  GRADIENT_DIRECTIONS ||= ['horizontal', 'vertical', 'diagonal_tl', 'diagonal_tr', 'radial', 'square']
 end
 
 module BarBar
@@ -1039,8 +1041,8 @@ class ConfigWindow < Gtk::Window
       # Border width
       border_width_spin = Gtk::SpinButton.new(BarBar::MIN_BORDER_WIDTH, BarBar::MAX_BORDER_WIDTH, 1)
       border_width_spin.value = BarBar::DEFAULT_BORDER_WIDTH
-      fg.attach(Gtk::Label.new('Width:'), 5, 1, 1, 1)
-      fg.attach(border_width_spin, 6, 1, 1, 1)
+      fg.attach(Gtk::Label.new('Width:'), 3, 0, 1, 1)
+      fg.attach(border_width_spin, 4, 0, 1, 1)
 
       # Gradient controls row 2
       gradient_check = Gtk::CheckButton.new('Gradient')
@@ -1875,8 +1877,8 @@ module BarBar
         BarBar.class_variable_get(:@@config)['show_timers'] = timer_item.active?
         File.write(BarBar::CONFIG_FILE, BarBar.class_variable_get(:@@config).to_yaml)
         BarBar.bar_windows.each do |bw|
-          bw.instance_variable_get(:@buttons).each_value do |info|
-            info[:btn].queue_draw
+          bw.instance_variable_get(:@buttons).each_value do |button|
+            button.widget.queue_draw if button.respond_to?(:widget) && button.widget
           end
         end
       end
