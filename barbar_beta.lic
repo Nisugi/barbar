@@ -820,7 +820,7 @@ class ConfigWindow < Gtk::Window
     super()
     set_title('BarBar Configurator')
     set_default_size(600, 400)
-    set_keep_above(true)
+    # set_keep_above(true)
     if parent_window
       set_transient_for(parent_window)
       set_position(Gtk::WindowPosition::CENTER_ON_PARENT)
