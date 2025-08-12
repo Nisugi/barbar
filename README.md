@@ -145,5 +145,3 @@ All variant options are selectable in the configurator — no manual entry neede
 * **Countdown not showing** — Ensure the timer field returns a positive number.
 
 ---
-
-Do you want me to also add a **built-in helpers reference table** to this README so users see all the possible `Effects`, `Spell`, and `Stats` functions they can use in conditions? That could make this a one-stop doc for them.
