@@ -111,6 +111,25 @@ class ConfigWindow < Gtk::Window
     end
   end
 
+  def rgba_to_hex(rgba)
+    # Convert Gdk::RGBA to hex string (without #)
+    r = (rgba.red * 255).to_i
+    g = (rgba.green * 255).to_i
+    b = (rgba.blue * 255).to_i
+    "%02x%02x%02x" % [r, g, b]
+  end
+
+  def hex_to_rgba(hex_str)
+    # Convert hex string to Gdk::RGBA
+    hex = hex_str.to_s.gsub('#', '')
+    return Gdk::RGBA.new(0, 1, 0, 1) unless hex =~ /^[0-9a-f]{6}$/i
+    
+    r = hex[0..1].to_i(16) / 255.0
+    g = hex[2..3].to_i(16) / 255.0
+    b = hex[4..5].to_i(16) / 255.0
+    Gdk::RGBA.new(r, g, b, 1.0)
+  end
+
   def build_button_manager_tab
     # 1) grab all the existing button defs
     defs     = BarBar.load_button_configs
@@ -162,47 +181,76 @@ class ConfigWindow < Gtk::Window
 
       preview = Gtk::Image.new
       preview.set_size_request(64, 64)
-      fg.attach(preview, 2, 0, 4, 2)
+      fg.attach(preview, 4, 0, 3, 3)
 
-      vcombo = Gtk::ComboBoxText.new
-      ['', 'grayscale', 'green', 'blue', 'red', 
-       'grayscale_green', 'grayscale_blue', 'grayscale_red'].each { |v| 
-        vcombo.append_text(v) 
-      }
-      vcombo.active = 0
-      fg.attach(Gtk::Label.new('Variant:'),   0, 0, 1, 1)
-      fg.attach(vcombo,                       1, 0, 1, 1)
+      # Grayscale checkbox
+      gs_check = Gtk::CheckButton.new('Grayscale')
+      fg.attach(gs_check, 0, 0, 1, 1)
 
+      # Border controls row 1
+      border_check = Gtk::CheckButton.new('Apply Border')
+      fg.attach(border_check, 0, 1, 1, 1)
+
+      color_btn = Gtk::ColorButton.new
+      color_btn.set_title("Choose Border Start Color")
+      color_btn.use_alpha = false
+      color_btn.set_rgba(Gdk::RGBA.new(0, 1, 0, 1))
+      fg.attach(Gtk::Label.new('Color:'), 1, 1, 1, 1)
+      fg.attach(color_btn, 2, 1, 1, 1)
+
+      # Border width
+      border_width_spin = Gtk::SpinButton.new(BarBar::MIN_BORDER_WIDTH, BarBar::MAX_BORDER_WIDTH, 1)
+      border_width_spin.value = BarBar::DEFAULT_BORDER_WIDTH
+      fg.attach(Gtk::Label.new('Width:'), 3, 1, 1, 1)
+      fg.attach(border_width_spin, 3, 2, 1, 1)
+
+      # Gradient controls row 2
+      gradient_check = Gtk::CheckButton.new('Gradient')
+      fg.attach(gradient_check, 0, 2, 1, 1)
+
+      color2_btn = Gtk::ColorButton.new
+      color2_btn.set_title("Choose Border End Color")
+      color2_btn.use_alpha = false
+      color2_btn.set_rgba(Gdk::RGBA.new(0, 0, 1, 1))
+      fg.attach(Gtk::Label.new('End:'), 1, 2, 1, 1)
+      fg.attach(color2_btn, 2, 2, 1, 1)
+
+      # Icon number row 3
       ispin = Gtk::SpinButton.new(1, total_icons, 1)
-      fg.attach(Gtk::Label.new('Icon #:'),    0, 1, 1, 1)
-      fg.attach(ispin,                        1, 1, 1, 1)
+      fg.attach(Gtk::Label.new('Icon #:'), 0, 3, 1, 1)
+      fg.attach(ispin, 1, 3, 2, 1)
 
       cmd_e = Gtk::Entry.new
-      fg.attach(Gtk::Label.new('Command:'),   0, 2, 1, 1)
-      fg.attach(cmd_e,                        1, 2, 54, 1)
+      fg.attach(Gtk::Label.new('Command:'),   0, 4, 1, 1)
+      fg.attach(cmd_e,                        1, 4, 54, 1)
 
       gc_e = Gtk::Entry.new
-      fg.attach(Gtk::Label.new('Group Cmd:'), 0, 3, 1, 1)
-      fg.attach(gc_e,                         1, 3, 54, 1)
+      fg.attach(Gtk::Label.new('Group Cmd:'), 0, 5, 1, 1)
+      fg.attach(gc_e,                         1, 5, 54, 1)
 
       cond_e = Gtk::Entry.new
-      fg.attach(Gtk::Label.new('Condition:'), 0, 4, 1, 1)
-      fg.attach(cond_e,                       1, 4, 54, 1)
+      fg.attach(Gtk::Label.new('Condition:'), 0, 6, 1, 1)
+      fg.attach(cond_e,                       1, 6, 54, 1)
 
       timer_e = Gtk::Entry.new
-      fg.attach(Gtk::Label.new('Timer:'),     0, 5, 1, 1)
-      fg.attach(timer_e,                      1, 5, 54, 1)
+      fg.attach(Gtk::Label.new('Timer:'),     0, 7, 1, 1)
+      fg.attach(timer_e,                      1, 7, 54, 1)
 
       tip_e = Gtk::Entry.new
-      fg.attach(Gtk::Label.new('Tooltip:'),   0, 6, 1, 1)
-      fg.attach(tip_e,                        1, 6, 54, 1)
+      fg.attach(Gtk::Label.new('Tooltip:'),   0, 8, 1, 1)
+      fg.attach(tip_e,                        1, 8, 54, 1)
 
       frame = Gtk::Frame.new(st_key)
       frame.add(fg)
       state_nb.append_page(frame, Gtk::Label.new(st_key))
 
       state_widgets[st_key] = {
-        variant: vcombo,
+        grayscale: gs_check,
+        border_enabled: border_check,
+        gradient_enabled: gradient_check,
+        color_button: color_btn,
+        color2_button: color2_btn,
+        border_width: border_width_spin,
         icon: ispin,
         command: cmd_e,
         group_command: gc_e,
@@ -212,10 +260,38 @@ class ConfigWindow < Gtk::Window
         preview: preview
       }
 
+      # Enable/disable gradient controls based on checkbox
+      gradient_check.signal_connect('toggled') do
+        color2_btn.sensitive = gradient_check.active?
+      end
+      color2_btn.sensitive = false  # Start disabled
+
       updater = -> {
-        base    = img_combo.active_text
-        variant_str = vcombo.active_text || ''
-        num     = ispin.value_as_int
+        base = img_combo.active_text
+        num = ispin.value_as_int
+        
+        # Build variant string from UI state
+        parts = []
+        parts << 'gs' if gs_check.active?
+        
+        if border_check.active?
+          if gradient_check.active?
+            # Gradient border
+            hex1 = rgba_to_hex(color_btn.rgba)
+            hex2 = rgba_to_hex(color2_btn.rgba)
+            parts << "cg_#{hex1}_#{hex2}"
+          else
+            # Solid border
+            hex = rgba_to_hex(color_btn.rgba)
+            parts << "c_#{hex}"
+          end
+          # Add border width if not default
+          bw = border_width_spin.value.to_i
+          parts << "bw_#{bw}" if bw != BarBar::DEFAULT_BORDER_WIDTH
+        end
+        
+        variant_str = parts.join('_')
+        
         begin
           # Use the variant system to get the icon
           icon = BarBar::Variants.get_icon(base, num, variant_str)
@@ -228,7 +304,12 @@ class ConfigWindow < Gtk::Window
       }
 
       img_combo.signal_connect('changed') { updater.call }
-      vcombo.signal_connect('changed') { updater.call }
+      gs_check.signal_connect('toggled') { updater.call }
+      border_check.signal_connect('toggled') { updater.call }
+      gradient_check.signal_connect('toggled') { updater.call }
+      color_btn.signal_connect('color-set') { updater.call }
+      color2_btn.signal_connect('color-set') { updater.call }
+      border_width_spin.signal_connect('value-changed') { updater.call }
       ispin.signal_connect('value-changed') { updater.call }
     end
 
@@ -245,7 +326,36 @@ class ConfigWindow < Gtk::Window
       state_widgets.each do |st, w|
         sd = data.dig('states', st.to_s) || {}
         w[:condition].text = sd['condition'].to_s
-        set_active_by_text(w[:variant], sd['variant'].to_s)
+        
+        # Parse variant string into components
+        variant = sd['variant'].to_s
+        w[:grayscale].active = variant.include?('gs')
+        
+        # Check for gradient
+        if variant =~ /cg_([0-9a-f]{6})_([0-9a-f]{6})/i
+          w[:border_enabled].active = true
+          w[:gradient_enabled].active = true
+          w[:color_button].set_rgba(hex_to_rgba($1))
+          w[:color2_button].set_rgba(hex_to_rgba($2))
+        # Check for solid color
+        elsif variant =~ /c_([0-9a-f]{6})/i
+          w[:border_enabled].active = true
+          w[:gradient_enabled].active = false
+          w[:color_button].set_rgba(hex_to_rgba($1))
+        else
+          w[:border_enabled].active = false
+          w[:gradient_enabled].active = false
+        end
+        
+        # Check for border width
+        if variant =~ /bw_(\d+)/
+          w[:border_width].value = $1.to_i
+        else
+          w[:border_width].value = BarBar::DEFAULT_BORDER_WIDTH
+        end
+        
+        w[:color2_button].sensitive = w[:gradient_enabled].active?
+        
         w[:icon].value         = sd['icon'].to_i
         w[:tooltip].text       = sd['tooltip'].to_s
         w[:timer].text         = sd['timer'].to_s
@@ -267,8 +377,30 @@ class ConfigWindow < Gtk::Window
 
       # build up the hash
       states_hash = state_widgets.each_with_object({}) do |(st, w), h|
+        # Build variant string from components
+        parts = []
+        parts << 'gs' if w[:grayscale].active?
+        
+        if w[:border_enabled].active?
+          if w[:gradient_enabled].active?
+            # Gradient border
+            hex1 = rgba_to_hex(w[:color_button].rgba)
+            hex2 = rgba_to_hex(w[:color2_button].rgba)
+            parts << "cg_#{hex1}_#{hex2}"
+          else
+            # Solid border
+            hex = rgba_to_hex(w[:color_button].rgba)
+            parts << "c_#{hex}"
+          end
+          # Add border width if not default
+          bw = w[:border_width].value.to_i
+          parts << "bw_#{bw}" if bw != BarBar::DEFAULT_BORDER_WIDTH
+        end
+        
+        variant_str = parts.join('_')
+        
         h[st.to_s] = {
-          'variant'       => w[:variant].active_text,
+          'variant'       => variant_str,
           'icon'          => w[:icon].value.to_i,
           'command'       => w[:command].text,
           'group_command' => w[:group_command].text,
