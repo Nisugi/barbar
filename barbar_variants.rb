@@ -218,40 +218,42 @@ module BarBar
       def apply_grayscale(pixbuf)
         # Create new pixbuf for result
         gray = pixbuf.copy
-        
+
         # Use GdkPixbuf's built-in saturation if available
         if gray.respond_to?(:saturate_and_pixelate)
-          gray.saturate_and_pixelate(gray, 0.0, false)
+          gray.saturate_and_pixelate(0.0, false)
           return gray
         end
-        
-        # Manual grayscale conversion
-        # Get pixel data
-        pixels = gray.pixels
-        rowstride = gray.rowstride
+
+        # Get pixel data - it's already an array
+        pixels = gray.pixels.is_a?(String) ? gray.pixels.bytes.to_a : gray.pixels.dup
         n_channels = gray.n_channels
-        
-        gray.height.times do |y|
-          gray.width.times do |x|
-            offset = y * rowstride + x * n_channels
-            
-            r = pixels[offset].unpack('C')[0]
-            g = pixels[offset + 1].unpack('C')[0]
-            b = pixels[offset + 2].unpack('C')[0]
-            
-            # Standard luminance formula
-            gray_value = (0.299 * r + 0.587 * g + 0.114 * b).to_i
-            
-            pixels[offset] = [gray_value].pack('C')
-            pixels[offset + 1] = [gray_value].pack('C')
-            pixels[offset + 2] = [gray_value].pack('C')
-            # Keep alpha channel (offset + 3) unchanged
-          end
+        width = gray.width
+        height = gray.height
+
+        # Process each pixel
+        (width * height).times do |i|
+          base = i * n_channels
+
+          r = pixels[base]
+          g = pixels[base + 1]
+          b = pixels[base + 2]
+
+          # Standard luminance formula
+          gray_value = (0.299 * r + 0.587 * g + 0.114 * b).to_i
+
+          pixels[base] = gray_value
+          pixels[base + 1] = gray_value
+          pixels[base + 2] = gray_value
+          # Keep alpha channel (base + 3) unchanged if it exists
         end
-        
+
+        # Convert back to proper format and apply to pixbuf
+        gray.pixels = pixels.is_a?(String) ? pixels : pixels.pack('C*')
+
         gray
       end
-      
+
       def apply_border(pixbuf, color)
         rgb = BORDER_COLORS[color] || BORDER_COLORS[:green]
         
@@ -259,66 +261,65 @@ module BarBar
         bordered = pixbuf.copy
         
         # Get pixel data
-        pixels = bordered.pixels
-        rowstride = bordered.rowstride
+        pixels = bordered.pixels.is_a?(String) ? bordered.pixels.bytes.to_a : bordered.pixels.dup
         n_channels = bordered.n_channels
         width = bordered.width
         height = bordered.height
         
-        # Helper to set pixel color
-        set_pixel = lambda do |x, y|
-          return if x < 0 || y < 0 || x >= width || y >= height
-          
-          offset = y * rowstride + x * n_channels
-          # Check if pixel has alpha > 0 (not transparent)
-          if n_channels > 3 && pixels[offset + 3].unpack('C')[0] > 0
-            # Only color the border on non-transparent pixels at edges
-            check_edge = false
-            
-            # Check if this pixel is at the edge of non-transparent area
-            (-1..1).each do |dy|
-              (-1..1).each do |dx|
-                next if dx == 0 && dy == 0
-                nx, ny = x + dx, y + dy
-                
-                if nx < 0 || ny < 0 || nx >= width || ny >= height
-                  check_edge = true
-                  break
-                end
-                
-                noffset = ny * rowstride + nx * n_channels
-                if pixels[noffset + 3].unpack('C')[0] == 0
-                  check_edge = true
-                  break
-                end
-              end
-              break if check_edge
-            end
-            
-            if check_edge
-              # Draw border pixel
-              pixels[offset] = [rgb[0]].pack('C')
-              pixels[offset + 1] = [rgb[1]].pack('C')
-              pixels[offset + 2] = [rgb[2]].pack('C')
-            end
-          end
+        # Helper to get pixel offset
+        get_offset = lambda do |x, y|
+          (y * width + x) * n_channels
         end
         
-        # Draw border on all edges
-        BORDER_WIDTH.times do |i|
-          # Top and bottom edges
+        # Helper to check if pixel is at edge of non-transparent area
+        is_edge = lambda do |x, y|
+          return false if x < 0 || y < 0 || x >= width || y >= height
+          
+          offset = get_offset.call(x, y)
+          # Skip transparent pixels
+          return false if n_channels > 3 && pixels[offset + 3] == 0
+          
+          # Check neighbors for transparency
+          [[-1,0], [1,0], [0,-1], [0,1], [-1,-1], [1,1], [-1,1], [1,-1]].each do |dx, dy|
+            nx, ny = x + dx, y + dy
+            # If neighbor is out of bounds or transparent, this is an edge
+            if nx < 0 || ny < 0 || nx >= width || ny >= height
+              return true
+            elsif n_channels > 3
+              n_offset = get_offset.call(nx, ny)
+              return true if pixels[n_offset + 3] == 0
+            end
+           end
+          false
+        end
+        
+        # Mark edge pixels
+        edge_pixels = []
+        height.times do |y|
           width.times do |x|
-            set_pixel.call(x, i)                    # Top
-            set_pixel.call(x, height - 1 - i)       # Bottom
-          end
-          
-          # Left and right edges
-          height.times do |y|
-            set_pixel.call(i, y)                    # Left
-            set_pixel.call(width - 1 - i, y)        # Right
+            edge_pixels << [x, y] if is_edge.call(x, y)
           end
         end
         
+        # Apply border to edge pixels and their immediate neighbors
+        edge_pixels.each do |x, y|
+          # Apply to this pixel and BORDER_WIDTH pixels inward
+          BORDER_WIDTH.times do |dist|
+            [[-dist,0], [dist,0], [0,-dist], [0,dist], 
+             [-dist,-dist], [dist,dist], [-dist,dist], [dist,-dist]].each do |dx, dy|
+              px, py = x + dx, y + dy
+              next if px < 0 || py < 0 || px >= width || py >= height
+              
+              offset = get_offset.call(px, py)
+              next if n_channels > 3 && pixels[offset + 3] == 0  # Skip transparent
+              
+              pixels[offset] = rgb[0]
+              pixels[offset + 1] = rgb[1]
+              pixels[offset + 2] = rgb[2]
+            end
+          end
+        end
+        bordered.pixels = pixels.is_a?(String) ? pixels : pixels.pack('C*')
         bordered
       end
     end

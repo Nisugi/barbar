@@ -83,18 +83,6 @@ class ConfigWindow < Gtk::Window
       # Pre-generate all icon variants
       button_configs = BarBar.load_button_configs
       result = BarBar::Variants.pregenerate_all(button_configs)
-      if result[:errors].any?
-        # Show warning dialog but continue
-        dialog = Gtk::MessageDialog.new(
-          parent: self,
-          flags: :destroy_with_parent,
-          type: :warning,
-          buttons_type: :ok,
-          message: "Some icon variants could not be generated:\n#{result[:errors].take(5).join("\n")}"
-        )
-        dialog.run
-        dialog.destroy
-      end
 
       # persist & reload all bars
       File.write(BarBar::CONFIG_FILE, @config.to_yaml)
@@ -160,7 +148,9 @@ class ConfigWindow < Gtk::Window
 
     # 5) Rows 4–10: state-frames in a sub-notebook
     state_keys = %w[inactive_ready inactive_unready active_ready active_unready]
-    total_icons = BarBar::ICONS_PER_ROW * BarBar::ICONS_PER_ROW
+    # Calculate total icons based on a 2048x2048 sprite map (32x32 icons)
+    icons_per_row = 2048 / BarBar::ICON_WIDTH
+    total_icons = icons_per_row * icons_per_row
     state_nb = Gtk::Notebook.new
     state_widgets = {}
 
@@ -326,7 +316,7 @@ class ConfigWindow < Gtk::Window
     ctrl.pack_start(Gtk::Label.new('Sprite Map:'), expand: false, fill: false, padding: 0)
     ctrl.pack_start(img_combo, expand: false, fill: false, padding: 0)
 
-    max_rows = BarBar::ICONS_PER_ROW
+    max_rows = 32  # Default for 2048x2048, will be updated
     row_spin = Gtk::SpinButton.new(1, max_rows, 1)
     ctrl.pack_start(Gtk::Label.new('Row:'), expand: false, fill: false, padding: 0)
     ctrl.pack_start(row_spin, expand: false, fill: false, padding: 0)
@@ -370,7 +360,7 @@ class ConfigWindow < Gtk::Window
           grid.attach(eb, i % 8, i / 8, 1, 1)
         end
 
-        range_lbl.text = "Icons #{start + 1}–#{start + BarBar::ICONS_PER_ROW}"
+        range_lbl.text = "Icons #{start + 1}–#{start + icons_per_row}"
         grid.show_all
       rescue => e
         range_lbl.text = "Error loading #{base}.png: #{e.message}"
