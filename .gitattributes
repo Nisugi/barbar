@@ -1,0 +1,6 @@
+*.lic           linguist-language=Ruby
+.git*           export-ignore
+*.yml           export-ignore
+.ruby-version   export-ignore
+README.md       export-ignore
+/barbar/*.rb    export-ignore 
