@@ -21,4 +21,6 @@ module BarBar
   MAX_BORDER_WIDTH ||= 5
   MIN_BORDER_WIDTH ||= 1
   DEFAULT_BORDER_WIDTH ||= 2
+
+  GRADIENT_DIRECTIONS ||= ['horizontal', 'vertical', 'diagonal_tl', 'diagonal_tr', 'radial', 'square']
 end

@@ -82,7 +82,7 @@ class ConfigWindow < Gtk::Window
 
       # Pre-generate all icon variants
       button_configs = BarBar.load_button_configs
-      BarBar::Variants.pregenerate_all(button_configs)
+      result = BarBar::Variants.pregenerate_all(button_configs)
 
       # persist & reload all bars
       File.write(BarBar::CONFIG_FILE, @config.to_yaml)
@@ -215,30 +215,41 @@ class ConfigWindow < Gtk::Window
       fg.attach(Gtk::Label.new('End:'), 1, 2, 1, 1)
       fg.attach(color2_btn, 2, 2, 1, 1)
 
-      # Icon number row 3
+      # Gradient direction dropdown
+      dir_combo = Gtk::ComboBoxText.new
+      dir_combo.append_text('Horizontal')
+      dir_combo.append_text('Vertical')
+      dir_combo.append_text('Diagonal ↘')
+      dir_combo.append_text('Diagonal ↙')
+      dir_combo.append_text('Radial')
+      dir_combo.append_text('Square')
+      dir_combo.active = 0
+      fg.attach(dir_combo, 3, 3, 1, 1)
+
+      # Icon number row 4
       ispin = Gtk::SpinButton.new(1, total_icons, 1)
-      fg.attach(Gtk::Label.new('Icon #:'), 0, 3, 1, 1)
-      fg.attach(ispin, 1, 3, 2, 1)
+      fg.attach(Gtk::Label.new('Icon #:'), 0, 4, 1, 1)
+      fg.attach(ispin, 1, 4, 2, 1)
 
       cmd_e = Gtk::Entry.new
-      fg.attach(Gtk::Label.new('Command:'),   0, 4, 1, 1)
-      fg.attach(cmd_e,                        1, 4, 54, 1)
+      fg.attach(Gtk::Label.new('Command:'),   0, 5, 1, 1)
+      fg.attach(cmd_e,                        1, 5, 54, 1)
 
       gc_e = Gtk::Entry.new
-      fg.attach(Gtk::Label.new('Group Cmd:'), 0, 5, 1, 1)
-      fg.attach(gc_e,                         1, 5, 54, 1)
+      fg.attach(Gtk::Label.new('Group Cmd:'), 0, 6, 1, 1)
+      fg.attach(gc_e,                         1, 6, 54, 1)
 
       cond_e = Gtk::Entry.new
-      fg.attach(Gtk::Label.new('Condition:'), 0, 6, 1, 1)
-      fg.attach(cond_e,                       1, 6, 54, 1)
+      fg.attach(Gtk::Label.new('Condition:'), 0, 7, 1, 1)
+      fg.attach(cond_e,                       1, 7, 54, 1)
 
       timer_e = Gtk::Entry.new
-      fg.attach(Gtk::Label.new('Timer:'),     0, 7, 1, 1)
-      fg.attach(timer_e,                      1, 7, 54, 1)
+      fg.attach(Gtk::Label.new('Timer:'),     0, 8, 1, 1)
+      fg.attach(timer_e,                      1, 8, 54, 1)
 
       tip_e = Gtk::Entry.new
-      fg.attach(Gtk::Label.new('Tooltip:'),   0, 8, 1, 1)
-      fg.attach(tip_e,                        1, 8, 54, 1)
+      fg.attach(Gtk::Label.new('Tooltip:'),   0, 9, 1, 1)
+      fg.attach(tip_e,                        1, 9, 54, 1)
 
       frame = Gtk::Frame.new(st_key)
       frame.add(fg)
@@ -250,6 +261,7 @@ class ConfigWindow < Gtk::Window
         gradient_enabled: gradient_check,
         color_button: color_btn,
         color2_button: color2_btn,
+        gradient_dir: dir_combo,
         border_width: border_width_spin,
         icon: ispin,
         command: cmd_e,
@@ -263,8 +275,10 @@ class ConfigWindow < Gtk::Window
       # Enable/disable gradient controls based on checkbox
       gradient_check.signal_connect('toggled') do
         color2_btn.sensitive = gradient_check.active?
+        dir_combo.sensitive = gradient_check.active?
       end
       color2_btn.sensitive = false  # Start disabled
+      dir_combo.sensitive = false   # Start disabled
 
       updater = -> {
         base = img_combo.active_text
@@ -279,7 +293,17 @@ class ConfigWindow < Gtk::Window
             # Gradient border
             hex1 = rgba_to_hex(color_btn.rgba)
             hex2 = rgba_to_hex(color2_btn.rgba)
-            parts << "cg_#{hex1}_#{hex2}"
+            # Map dropdown text to direction code
+            dir_map = {
+              'Horizontal' => 'h',
+              'Vertical' => 'v',
+              'Diagonal ↘' => 'd',
+              'Diagonal ↙' => 'b',
+              'Radial' => 'r',
+              'Square' => 's'
+            }
+            dir = dir_map[dir_combo.active_text] || 'h'
+            parts << "cg_#{hex1}_#{hex2}_#{dir}"
           else
             # Solid border
             hex = rgba_to_hex(color_btn.rgba)
@@ -309,6 +333,9 @@ class ConfigWindow < Gtk::Window
       gradient_check.signal_connect('toggled') { updater.call }
       color_btn.signal_connect('color-set') { updater.call }
       color2_btn.signal_connect('color-set') { updater.call }
+      dir_combo.signal_connect('changed') { updater.call }
+      border_width_spin.signal_connect('value-changed') { updater.call }
+      ispin.signal_connect('value-changed') { updater.call }
       border_width_spin.signal_connect('value-changed') { updater.call }
       ispin.signal_connect('value-changed') { updater.call }
     end
@@ -331,12 +358,23 @@ class ConfigWindow < Gtk::Window
         variant = sd['variant'].to_s
         w[:grayscale].active = variant.include?('gs')
         
-        # Check for gradient
-        if variant =~ /cg_([0-9a-f]{6})_([0-9a-f]{6})/i
+        # Check for gradient with direction
+        if variant =~ /cg_([0-9a-f]{6})_([0-9a-f]{6})(?:_(\w+))?/i
           w[:border_enabled].active = true
           w[:gradient_enabled].active = true
           w[:color_button].set_rgba(hex_to_rgba($1))
           w[:color2_button].set_rgba(hex_to_rgba($2))
+          # Set direction dropdown
+          dir_code = $3 || 'h'
+          dir_text = case dir_code
+                     when 'v' then 'Vertical'
+                     when 'd' then 'Diagonal ↘'
+                     when 'b' then 'Diagonal ↙'
+                     when 'r' then 'Radial'
+                     when 's' then 'Square'
+                     else 'Horizontal'
+                     end
+          set_active_by_text(w[:gradient_dir], dir_text)
         # Check for solid color
         elsif variant =~ /c_([0-9a-f]{6})/i
           w[:border_enabled].active = true
@@ -355,6 +393,7 @@ class ConfigWindow < Gtk::Window
         end
         
         w[:color2_button].sensitive = w[:gradient_enabled].active?
+        w[:gradient_dir].sensitive = w[:gradient_enabled].active?
         
         w[:icon].value         = sd['icon'].to_i
         w[:tooltip].text       = sd['tooltip'].to_s
@@ -383,10 +422,20 @@ class ConfigWindow < Gtk::Window
         
         if w[:border_enabled].active?
           if w[:gradient_enabled].active?
-            # Gradient border
+            # Gradient border with direction
             hex1 = rgba_to_hex(w[:color_button].rgba)
             hex2 = rgba_to_hex(w[:color2_button].rgba)
-            parts << "cg_#{hex1}_#{hex2}"
+            # Map dropdown text to direction code
+            dir_map = {
+              'Horizontal' => 'h',
+              'Vertical' => 'v',
+              'Diagonal ↘' => 'dt',
+              'Diagonal ↙' => 'db',
+              'Radial' => 'r',
+              'Square' => 's'
+            }
+            dir = dir_map[w[:gradient_dir].active_text] || 'h'
+            parts << "cg_#{hex1}_#{hex2}_#{dir}"
           else
             # Solid border
             hex = rgba_to_hex(w[:color_button].rgba)
@@ -419,25 +468,6 @@ class ConfigWindow < Gtk::Window
 
       BarBar.instance_variable_set(:@button_configs, defs)
       BarBar.save_button_configs
-
-      # Refresh all bar pickers so new/renamed buttons appear immediately
-      begin
-        defs = BarBar.load_button_configs
-        @config['bars'].each do |bar_cfg|
-          ctrls = @controls[bar_cfg['id']]
-          next unless ctrls && ctrls[:store]
-          store = ctrls[:store]
-          store.clear
-          defs.keys.sort.each do |k|
-            iter = store.append
-            iter[0] = k
-            iter[1] = Array(bar_cfg['buttons']).include?(k)
-          end
-        end
-      rescue => e
-        BarBar.log(:debug, "Refresh pickers after save failed: #{e}")
-      end
-
       set_active_by_text(key_sel, key)
     end
 
