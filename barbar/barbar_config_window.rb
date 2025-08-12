@@ -202,7 +202,7 @@ class ConfigWindow < Gtk::Window
       border_width_spin = Gtk::SpinButton.new(BarBar::MIN_BORDER_WIDTH, BarBar::MAX_BORDER_WIDTH, 1)
       border_width_spin.value = BarBar::DEFAULT_BORDER_WIDTH
       fg.attach(Gtk::Label.new('Width:'), 3, 1, 1, 1)
-      fg.attach(border_width_spin, 3, 2, 1, 1)
+      fg.attach(border_width_spin, 3, 0, 1, 1)
 
       # Gradient controls row 2
       gradient_check = Gtk::CheckButton.new('Gradient')
@@ -224,7 +224,7 @@ class ConfigWindow < Gtk::Window
       dir_combo.append_text('Radial')
       dir_combo.append_text('Square')
       dir_combo.active = 0
-      fg.attach(dir_combo, 3, 3, 1, 1)
+      fg.attach(dir_combo, 3, 2, 1, 1)
 
       # Icon number row 4
       ispin = Gtk::SpinButton.new(1, total_icons, 1)
