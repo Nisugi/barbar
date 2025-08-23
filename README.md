@@ -25,7 +25,7 @@ It lets you create clickable buttons with custom icons, tooltips, timers, and st
 2. Place any **sprite maps** you want to use into:
 
    ```
-   lich5/data/icons/
+   lich5/data/barbar/icons/
    ```
 3. Launch the script in-game:
 
