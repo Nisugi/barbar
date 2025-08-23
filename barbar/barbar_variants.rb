@@ -3,7 +3,7 @@
 
 module BarBar
   module Variants
-    CACHE_VERSION = 2  # Bumped to invalidate old cache
+    CACHE_VERSION = 3  # Bumped for gradient direction support
     CACHE_DIR = File.join(ICON_FOLDER, 'cache', 'variants')
     MANIFEST_FILE = File.join(CACHE_DIR, 'manifest.yaml')
     
@@ -147,9 +147,9 @@ module BarBar
         # Check for grayscale (now 'gs' instead of single letter)
         parts << 'gs' if variant_string.include?('gs')
         
-        # Check for gradient (cg_RRGGBB_RRGGBB)
-        if variant_string =~ /cg_([0-9a-fA-F]{6})_([0-9a-fA-F]{6})/
-          parts << "cg_#{$1.downcase}_#{$2.downcase}"
+        # Check for gradient with direction (cg_RRGGBB_RRGGBB_dir)
+        if variant_string =~ /cg_([0-9a-fA-F]{6})_([0-9a-fA-F]{6})_([hvdbrs])/
+          parts << "cg_#{$1.downcase}_#{$2.downcase}_#{$3}"
         # Check for solid color (c_RRGGBB)
         elsif variant_string =~ /c_([0-9a-fA-F]{6})/
           parts << "c_#{$1.downcase}"
@@ -223,21 +223,23 @@ module BarBar
           result = apply_grayscale(result)
         end
         
-        # Extract border width if specified
+        # Extract border width FIRST (before we look for colors)
         border_width = DEFAULT_BORDER_WIDTH
         if variant_string =~ /bw_(\d+)/
           border_width = $1.to_i.clamp(MIN_BORDER_WIDTH, MAX_BORDER_WIDTH)
         end
         
         # Then apply border if color is specified
-        if variant_string =~ /cg_([0-9a-fA-F]{6})_([0-9a-fA-F]{6})/
-          # Gradient border
+        # Need to handle the case where bw_N might come after the gradient
+        if variant_string =~ /cg_([0-9a-fA-F]{6})_([0-9a-fA-F]{6})_([hvdbrs])/
+          # Gradient border with direction (direction is required, single letter)
           hex_color = "#{$1}_#{$2}"
-          result = apply_border(result, hex_color, border_width)
+          direction = $3
+          result = apply_border(result, hex_color, border_width, direction)
         elsif variant_string =~ /c_([0-9a-fA-F]{6})/
           # Solid border
           hex_color = $1
-          result = apply_border(result, hex_color, border_width)
+          result = apply_border(result, hex_color, border_width, nil)
         end
         
         result
@@ -352,7 +354,15 @@ module BarBar
         [r, g, b]
       end
 
-      def apply_border(pixbuf, hex_color, border_width = nil)
+      def calculate_gradient_color(start_rgb, end_rgb, t)
+        # Interpolate between start and end colors based on t (0.0 to 1.0)
+        r = (start_rgb[0] * (1-t) + end_rgb[0] * t).to_i
+        g = (start_rgb[1] * (1-t) + end_rgb[1] * t).to_i
+        b = (start_rgb[2] * (1-t) + end_rgb[2] * t).to_i
+        [r, g, b]
+      end
+
+      def apply_border(pixbuf, hex_color, border_width = nil, direction = nil)
         # Parse hex_color which might be "RRGGBB" or "RRGGBB_RRGGBB" for gradient
         colors = hex_color.split('_')
         start_rgb = hex_to_rgb(colors[0])
@@ -380,6 +390,11 @@ module BarBar
         end
 
         neighbors = [[-1,0],[1,0],[0,-1],[0,1],[-1,-1],[1,1],[-1,1],[1,-1]]
+        
+        # Calculate center point for radial gradients
+        cx = w / 2.0
+        cy = h / 2.0
+        max_dist = Math.sqrt(cx * cx + cy * cy)
 
         # edge detection + draw inward border
         h.times do |y|
@@ -402,13 +417,27 @@ module BarBar
                 next if px < 0 || py < 0 || px >= w || py >= h
                 next if has_alpha && !solid[py][px]
                 
-                # Calculate color (gradient or solid)
+                # Calculate color based on gradient type
                 if is_gradient
-                  # Interpolate based on position
-                  t = px.to_f / w.to_f  # Simple left-to-right gradient
-                  r = (start_rgb[0] * (1-t) + end_rgb[0] * t).to_i
-                  g = (start_rgb[1] * (1-t) + end_rgb[1] * t).to_i
-                  b = (start_rgb[2] * (1-t) + end_rgb[2] * t).to_i
+                  t = case direction
+                      when 'v'  # vertical
+                        py.to_f / h.to_f
+                      when 'd'  # diagonal top-left to bottom-right (↘)
+                        (px.to_f / w.to_f + py.to_f / h.to_f) / 2.0
+                      when 'b'  # diagonal top-right to bottom-left (↙)
+                        ((w - px).to_f / w.to_f + py.to_f / h.to_f) / 2.0
+                      when 'r'  # radial
+                        dist = Math.sqrt((px - cx) ** 2 + (py - cy) ** 2)
+                        (dist / max_dist).clamp(0.0, 1.0)
+                      when 's'  # square
+                        dx_norm = (px - cx).abs / cx
+                        dy_norm = (py - cy).abs / cy
+                        [dx_norm, dy_norm].max.clamp(0.0, 1.0)
+                      else      # horizontal (default)
+                        px.to_f / w.to_f
+                      end
+                  
+                  r, g, b = calculate_gradient_color(start_rgb, end_rgb, t)
                 else
                   r, g, b = start_rgb
                 end

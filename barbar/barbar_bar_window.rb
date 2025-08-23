@@ -72,8 +72,8 @@ module BarBar
         BarBar.class_variable_get(:@@config)['show_timers'] = timer_item.active?
         File.write(BarBar::CONFIG_FILE, BarBar.class_variable_get(:@@config).to_yaml)
         BarBar.bar_windows.each do |bw|
-          bw.instance_variable_get(:@buttons).each_value do |info|
-            info[:btn].queue_draw
+          bw.instance_variable_get(:@buttons).each_value do |button|
+            button.widget.queue_draw if button.respond_to?(:widget) && button.widget
           end
         end
       end
@@ -154,10 +154,11 @@ module BarBar
     end
 
     def smart_update_buttons
+  return false if @win.nil? || (@win.respond_to?(:destroyed?) && @win.destroyed?)
       now = Time.now.to_f
       updates_needed = false
 
-      visible_area = @win.visible? ? @win.allocation : nil
+      visible_area = ( @win && (!@win.respond_to?(:destroyed?) || !@win.destroyed?) && @win.visible? ) ? @win.allocation : nil
 
       @buttons.each do |key, button|
         next if button.destroyed?
@@ -205,6 +206,7 @@ module BarBar
 
       # Finally destroy window
       @win.destroy
+  @win = nil
     end
 
     def toggle_decorations
