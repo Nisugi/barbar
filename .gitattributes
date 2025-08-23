@@ -4,3 +4,4 @@
 .ruby-version   export-ignore
 README.md       export-ignore
 /barbar/*.rb    export-ignore 
+barbar/         export-ignore
