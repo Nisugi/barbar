@@ -703,7 +703,6 @@ module BarBar
       def apply_grayscale(pixbuf)
         bytes, w, h, n, cs, has_a, bps = to_tight_bytes(pixbuf)
         tight = w * n
-        has_alpha = (n > 3)
 
         h.times do |y|
           row = y * tight
@@ -778,7 +777,6 @@ module BarBar
 
         # edge detection + draw inward border
         h.times do |y|
-          row = y * tight
           w.times do |x|
             next unless solid[y][x]
             edge = false
@@ -922,7 +920,7 @@ class ConfigWindow < Gtk::Window
 
       # Pre-generate all icon variants
       button_configs = BarBar.load_button_configs
-      result = BarBar::Variants.pregenerate_all(button_configs)
+      BarBar::Variants.pregenerate_all(button_configs)
 
       # persist & reload all bars
       File.write(BarBar::CONFIG_FILE, @config.to_yaml)
@@ -1945,9 +1943,9 @@ module BarBar
 
     def format_time(sec)
       case sec
-      when 0...100
+      when 0...60
         "#{sec}s"
-      when 100...5940
+      when 61...5940
         # round to nearest minute
         minutes = (sec / 60.0).round
         "#{minutes}m"
@@ -1959,7 +1957,7 @@ module BarBar
     end
 
     def smart_update_buttons
-  return false if @win.nil? || (@win.respond_to?(:destroyed?) && @win.destroyed?)
+      return false if @win.nil? || (@win.respond_to?(:destroyed?) && @win.destroyed?)
       now = Time.now.to_f
       updates_needed = false
 
@@ -1991,9 +1989,9 @@ module BarBar
       return 0.25 unless timer_seconds && timer_seconds > 0
 
       case timer_seconds
-      when 0..15
+      when 0..60
         1.0     # Update every second for last 10 seconds
-      when 16..3599
+      when 61..3599
         5.0     # Update every 5 seconds for under an hour
       else
         300.0   # Update every 5 minutes for hours
