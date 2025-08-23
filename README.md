@@ -140,7 +140,7 @@ All variant options are selectable in the configurator — no manual entry neede
 
 ## Troubleshooting
 
-* **Icons missing** — Make sure sprite map is in `lich5/data/icons/` and file name matches image name in configurator.
+* **Icons missing** — Make sure sprite map is in `lich5/data/barbar/icons/` and file name matches image name in configurator.
 * **New button not in bar list** — Save the definition, then check bar settings for the button’s category.
 * **Countdown not showing** — Ensure the timer field returns a positive number.
 
